@@ -190,7 +190,7 @@ fun RilanRoot(vm: MainViewModel) {
 
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // 应用一直开着时，天气最多 10 分钟、信息流最多 8 分钟就会刷新一次；
+    // 应用一直开着时，天气最多 5 分钟、信息流最多 8 分钟就会刷新一次；
     // 跨天也会顺带换壁纸和清掉昨天的 AI 总览。只在 RESUMED 时发请求。
     LaunchedEffect(lifecycleOwner) {
         while (true) {

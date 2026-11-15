@@ -162,20 +162,21 @@ fun HomeScreen(
     ) {
         HomeHeader(
             state = state,
-            currentPage = currentPage,
-            onSelectPage = { index -> scope.launch { pager.animateScrollToPage(index) } },
             onRefresh = onRefresh,
             onOpenSettings = onOpenSettings,
         )
 
-        HorizontalPager(
-            state = pager,
-            modifier = Modifier
+        Box(
+            Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 4.dp),
-            pageSpacing = 6.dp,
-        ) { page ->
+        ) {
+            HorizontalPager(
+                state = pager,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                pageSpacing = 6.dp,
+            ) { page ->
             Box(
                 Modifier
                     .fillMaxSize()
@@ -234,6 +235,14 @@ fun HomeScreen(
                     )
                 }
             }
+            }
+            PageRail(
+                current = currentPage,
+                onSelect = { index -> scope.launch { pager.animateScrollToPage(index) } },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 6.dp),
+            )
         }
     }
 }
@@ -245,8 +254,6 @@ fun HomeScreen(
 @Composable
 private fun HomeHeader(
     state: HomeState,
-    currentPage: Int,
-    onSelectPage: (Int) -> Unit,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
@@ -277,8 +284,6 @@ private fun HomeHeader(
                     style = MaterialTheme.typography.labelSmall,
                     color = RilanColors.TextTertiary,
                 )
-                Spacer(Modifier.weight(1f))
-                PagePips(current = currentPage, onSelect = onSelectPage)
             }
             Spacer(Modifier.height(5.dp))
             Row(
@@ -373,36 +378,45 @@ private fun headerSubtitle(state: HomeState): String {
     }
 }
 
-/** 顶部四颗小圆点，替代原来占一整行的页码条。 */
+/** 四段很细的页轨，替代原来占一整行的页码条。 */
 @Composable
-private fun PagePips(current: Int, onSelect: (Int) -> Unit) {
+private fun PageRail(
+    current: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Row(
-        horizontalArrangement = Arrangement.spacedBy(1.dp),
+        modifier
+            .clip(CircleShape)
+            .background(RilanColors.Ink.copy(alpha = 0.26f))
+            .border(0.5.dp, Color.White.copy(alpha = 0.10f), CircleShape)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         PAGE_LABELS.indices.forEach { index ->
             val active = index == current
             val width by animateDpAsState(
-                targetValue = if (active) 13.dp else 4.dp,
+                targetValue = if (active) 24.dp else 9.dp,
                 animationSpec = spring(stiffness = 520f, dampingRatio = 0.84f),
-                label = "pagePipWidth$index",
+                label = "pageRailWidth$index",
             )
             val color by animateColorAsState(
-                targetValue = if (active) RilanColors.Moon else Color.White.copy(alpha = 0.24f),
+                targetValue = if (active) RilanColors.Moon else Color.White.copy(alpha = 0.22f),
                 animationSpec = tween(220),
-                label = "pagePipColor$index",
+                label = "pageRailColor$index",
             )
             Box(
                 Modifier
                     .width(width + 10.dp)
-                    .height(24.dp)
+                    .height(18.dp)
                     .clickable { onSelect(index) },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
                     Modifier
                         .width(width)
-                        .height(3.dp)
+                        .height(2.5.dp)
                         .clip(CircleShape)
                         .background(color)
                 )
@@ -443,7 +457,7 @@ private fun BriefingPage(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = CARD_BOTTOM_INSET)
+                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = CARD_BOTTOM_INSET)
                 .animateContentSize(spring(stiffness = 380f, dampingRatio = 0.86f)),
             verticalArrangement = Arrangement.spacedBy(15.dp),
         ) {
@@ -723,7 +737,7 @@ private fun NewsPage(
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 10.dp),
+                    .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 PageHeading(
@@ -1117,7 +1131,7 @@ private fun TodayPage(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = CARD_BOTTOM_INSET),
+                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = CARD_BOTTOM_INSET),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             PageHeading(

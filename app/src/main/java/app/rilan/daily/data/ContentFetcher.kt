@@ -43,8 +43,8 @@ private class SourceError(message: String) : Exception(message)
 // 常量
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 同时最多 6 个请求在飞，热搜 + 来源插件一起算。 */
-private const val MAX_CONCURRENCY = 6
+/** 同时最多 8 个请求在飞，热搜 + 来源插件一起算；减少慢源拖住整轮刷新。 */
+private const val MAX_CONCURRENCY = 8
 
 private const val WEIBO_URL = "https://weibo.com/ajax/side/hotSearch"
 private const val BILIBILI_URL = "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1"

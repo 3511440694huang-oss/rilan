@@ -163,7 +163,7 @@ class AppRepository(context: Context) : McpHost {
 
     private fun isWeatherStale(): Boolean {
         val last = _settings.value.lastWeatherAt
-        return last <= 0L || System.currentTimeMillis() - last > 10 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > 5 * 60_000L
     }
 
     private fun isContentStale(): Boolean {

@@ -96,7 +96,7 @@ internal fun WeatherHero(
                 Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = WEATHER_BOTTOM_INSET),
+                    .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = WEATHER_BOTTOM_INSET),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 WeatherTop(
