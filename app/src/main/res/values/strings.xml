@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">日览</string>
+    <string name="notif_channel_reminder">日程提醒</string>
+    <string name="notif_channel_reminder_desc">重要日程的提前提醒与生日提醒</string>
+</resources>
