@@ -1,5 +1,6 @@
 package app.rilan.daily.ui.review
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
@@ -34,12 +35,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,6 +58,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -59,7 +67,12 @@ import androidx.compose.ui.unit.dp
 import app.rilan.daily.core.AiDigest
 import app.rilan.daily.core.Category
 import app.rilan.daily.core.NewsRecord
+import app.rilan.daily.core.SummaryMode
 import app.rilan.daily.core.SummaryPeriod
+import app.rilan.daily.data.ExportFormat
+import app.rilan.daily.data.ExportOutcome
+import app.rilan.daily.data.ExportRange
+import app.rilan.daily.data.RecordExporter
 import app.rilan.daily.ui.components.AiMarkdown
 import app.rilan.daily.ui.components.EmptyState
 import app.rilan.daily.ui.components.ErrorLine
@@ -73,6 +86,7 @@ import app.rilan.daily.ui.components.ScreenTitle
 import app.rilan.daily.ui.components.SectionLabel
 import app.rilan.daily.ui.components.TextAction
 import app.rilan.daily.ui.theme.RilanColors
+import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.LocalDate
 import java.time.YearMonth
@@ -90,6 +104,7 @@ private val StampFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("M月d�
 private data class PeriodRecord(val record: NewsRecord, val date: LocalDate)
 private data class ChartBucket(val label: String, val count: Int)
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ReviewScreen(
     records: List<NewsRecord>,
@@ -99,10 +114,26 @@ fun ReviewScreen(
     onGenerate: (SummaryPeriod) -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    // 新增的 API Key 直连 / 模式切换参数都带默认值：RilanRoot 接线前后都能编译运行。
+    deepseekConfigured: Boolean = false,
+    summaryMode: SummaryMode = SummaryMode.MCP,
+    onModeChange: (SummaryMode) -> Unit = {},
+    onGenerateDirect: (SummaryPeriod) -> Unit = {},
 ) {
     val today = LocalDate.now()
     val zone = remember { ZoneId.systemDefault() }
     var selected by rememberSaveable { mutableStateOf(SummaryPeriod.WEEK) }
+    var showExport by rememberSaveable { mutableStateOf(false) }
+
+    // 与 PeriodBody 里的统计 / 时间线用同一套归档规则，导出内容与界面看到的一致。
+    val currentPeriodRecords = remember(records, selected, today, zone) {
+        collectPeriodRecords(records, selected.startDate(today), today, zone).map { it.record }
+    }
+    // 只有当前模式还缺条件时才在顶部提示；另一种已经可用就不再打扰。
+    val needsSetup = when (summaryMode) {
+        SummaryMode.MCP -> !aiConfigured
+        SummaryMode.DEEPSEEK -> !deepseekConfigured
+    }
 
     Column(
         modifier = modifier
@@ -117,18 +148,34 @@ fun ReviewScreen(
             title = "这段时间",
             subtitle = "从你收录的内容里，看看脉络与变化",
             actions = {
-                GlassPill(
-                    text = "已收录 ${records.size} 条",
-                    modifier = Modifier.padding(top = 6.dp),
-                    color = RilanColors.Mint.copy(alpha = 0.92f),
-                    background = Color(0x1FB5CEFF),
-                )
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    GlassPill(
+                        text = "已收录 ${records.size} 条",
+                        modifier = Modifier.padding(top = 6.dp),
+                        color = RilanColors.Mint.copy(alpha = 0.92f),
+                        background = Color(0x1FB5CEFF),
+                    )
+                    Box(
+                        Modifier
+                            .clip(CircleShape)
+                            .clickable(onClick = { showExport = true }),
+                    ) {
+                        GlassPill(
+                            text = "导出收录",
+                            color = RilanColors.Mint.copy(alpha = 0.92f),
+                            background = Color(0x1FB5CEFF),
+                        )
+                    }
+                }
             },
         )
 
-        if (!aiConfigured) {
+        if (needsSetup) {
             Spacer(Modifier.height(16.dp))
-            AiSetupHint(onOpenSettings = onOpenSettings)
+            AiSetupHint(mode = summaryMode, onOpenSettings = onOpenSettings)
         }
 
         Spacer(Modifier.height(22.dp))
@@ -169,12 +216,32 @@ fun ReviewScreen(
                 digestIsCurrent = digestIsCurrent,
                 loading = loading == period,
                 aiConfigured = aiConfigured,
+                deepseekConfigured = deepseekConfigured,
+                summaryMode = summaryMode,
+                onModeChange = onModeChange,
                 onGenerate = { onGenerate(period) },
+                onGenerateDirect = { onGenerateDirect(period) },
                 onOpenSettings = onOpenSettings,
             )
         }
 
         Spacer(Modifier.height(24.dp))
+    }
+
+    if (showExport) {
+        ModalBottomSheet(
+            onDismissRequest = { showExport = false },
+            sheetState = rememberModalBottomSheetState(),
+            containerColor = RilanColors.Surface,
+        ) {
+            ExportSheet(
+                allRecords = records,
+                currentRecords = currentPeriodRecords,
+                period = selected,
+                today = today,
+                onDismiss = { showExport = false },
+            )
+        }
     }
 }
 
@@ -183,7 +250,21 @@ fun ReviewScreen(
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun AiSetupHint(onOpenSettings: () -> Unit) {
+private fun AiSetupHint(mode: SummaryMode, onOpenSettings: () -> Unit) {
+    val title = when (mode) {
+        SummaryMode.MCP -> "MCP 还没启动"
+        SummaryMode.DEEPSEEK -> "DeepSeek 还没连接"
+    }
+    val body = when (mode) {
+        SummaryMode.MCP ->
+            "启动 MCP 后，外部 AI 可读取历史新闻，并调用 save_period_summary 写回这段时间的脉络。"
+        SummaryMode.DEEPSEEK ->
+            "在扩展页填一个 DeepSeek API Key，就能在应用内直接生成周期总结，不需要启动 MCP。"
+    }
+    val action = when (mode) {
+        SummaryMode.MCP -> "打开扩展页"
+        SummaryMode.DEEPSEEK -> "去扩展页填 Key"
+    }
     GlassCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(22.dp),
@@ -194,18 +275,18 @@ private fun AiSetupHint(onOpenSettings: () -> Unit) {
                 Box(Modifier.size(7.dp).clip(CircleShape).background(RilanColors.Gold))
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    "MCP 还没启动",
+                    title,
                     style = MaterialTheme.typography.labelMedium,
                     color = RilanColors.Gold,
                 )
             }
             Text(
-                "启动 MCP 后，外部 AI 可读取历史新闻，并调用 save_period_summary 写回这段时间的脉络。",
+                body,
                 style = MaterialTheme.typography.bodySmall,
                 color = RilanColors.TextSecondary,
             )
             MintButton(
-                text = "打开扩展页",
+                text = action,
                 onClick = onOpenSettings,
                 compact = true,
             )
@@ -327,7 +408,11 @@ private fun PeriodBody(
     digestIsCurrent: Boolean,
     loading: Boolean,
     aiConfigured: Boolean,
+    deepseekConfigured: Boolean,
+    summaryMode: SummaryMode,
+    onModeChange: (SummaryMode) -> Unit,
     onGenerate: () -> Unit,
+    onGenerateDirect: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -337,7 +422,11 @@ private fun PeriodBody(
             digestIsCurrent = digestIsCurrent,
             loading = loading,
             aiConfigured = aiConfigured,
+            deepseekConfigured = deepseekConfigured,
+            summaryMode = summaryMode,
+            onModeChange = onModeChange,
             onGenerate = onGenerate,
+            onGenerateDirect = onGenerateDirect,
             onOpenSettings = onOpenSettings,
         )
         if (items.isNotEmpty()) {
@@ -609,9 +698,21 @@ private fun DigestCard(
     digestIsCurrent: Boolean,
     loading: Boolean,
     aiConfigured: Boolean,
+    deepseekConfigured: Boolean,
+    summaryMode: SummaryMode,
+    onModeChange: (SummaryMode) -> Unit,
     onGenerate: () -> Unit,
+    onGenerateDirect: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
+    var confirmOverwrite by remember { mutableStateOf(false) }
+    // 已有「当前周期且有正文」的总结才需要确认覆盖；失败留下的错误记录直接重试。
+    val hasCurrentSummary = digest != null && digestIsCurrent &&
+        digest.content.isNotBlank() && digest.error.isNullOrBlank()
+    val requestDirect = {
+        if (hasCurrentSummary) confirmOverwrite = true else onGenerateDirect()
+    }
+
     GlassCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(28.dp),
@@ -620,26 +721,44 @@ private fun DigestCard(
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SectionLabel(
-                text = "外部 AI 周期总结",
+                text = when (summaryMode) {
+                    SummaryMode.MCP -> "外部 AI 周期总结"
+                    SummaryMode.DEEPSEEK -> "DeepSeek 周期总结"
+                },
                 accent = RilanColors.Gold,
                 trailing = {
-                    if (digest != null && aiConfigured && !loading) {
-                        GlassIconButton(
-                            icon = Icons.Filled.Refresh,
-                            contentDescription = "如何更新",
-                            onClick = onGenerate,
-                            size = 36.dp,
-                            tint = RilanColors.Gold,
-                        )
+                    if (digest != null && !loading) {
+                        when {
+                            summaryMode == SummaryMode.MCP && aiConfigured -> GlassIconButton(
+                                icon = Icons.Filled.Refresh,
+                                contentDescription = "如何更新",
+                                onClick = onGenerate,
+                                size = 36.dp,
+                                tint = RilanColors.Gold,
+                            )
+                            summaryMode == SummaryMode.DEEPSEEK && deepseekConfigured -> GlassIconButton(
+                                icon = Icons.Filled.Refresh,
+                                contentDescription = "重新生成",
+                                onClick = requestDirect,
+                                size = 36.dp,
+                                tint = RilanColors.Gold,
+                            )
+                        }
                     }
                 },
+            )
+
+            SummaryModeSelector(
+                selected = summaryMode,
+                onSelect = onModeChange,
+                enabled = !loading,
             )
 
             when {
                 loading -> {
                     LoadingLines(lines = 4)
                     Text(
-                        text = "正在等待外部 AI 写入…",
+                        text = "DeepSeek 正在读这段时间的收录…",
                         style = MaterialTheme.typography.bodySmall,
                         color = RilanColors.Mint.copy(alpha = 0.9f),
                     )
@@ -648,13 +767,60 @@ private fun DigestCard(
                     digest = digest,
                     digestIsCurrent = digestIsCurrent,
                     aiConfigured = aiConfigured,
+                    deepseekConfigured = deepseekConfigured,
+                    summaryMode = summaryMode,
                     onGenerate = onGenerate,
+                    onRegenerateDirect = requestDirect,
                     onOpenSettings = onOpenSettings,
                 )
-                aiConfigured -> GenerateCta(onGenerate = onGenerate)
-                else -> ConnectCta(onOpenSettings = onOpenSettings)
+                summaryMode == SummaryMode.MCP ->
+                    if (aiConfigured) {
+                        McpGenerateCta(onGenerate = onGenerate)
+                    } else {
+                        McpConnectCta(onOpenSettings = onOpenSettings)
+                    }
+                else ->
+                    if (deepseekConfigured) {
+                        DirectGenerateCta(onGenerate = onGenerateDirect)
+                    } else {
+                        DirectConnectCta(onOpenSettings = onOpenSettings)
+                    }
             }
         }
+    }
+
+    if (confirmOverwrite) {
+        AlertDialog(
+            onDismissRequest = { confirmOverwrite = false },
+            title = {
+                Text(
+                    "覆盖当前总结？",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = RilanColors.Text,
+                )
+            },
+            text = {
+                Text(
+                    "这个周期已经有一份总结，重新生成会覆盖它。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = RilanColors.TextSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmOverwrite = false
+                    onGenerateDirect()
+                }) {
+                    Text("覆盖生成", color = RilanColors.Mint)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmOverwrite = false }) {
+                    Text("取消", color = RilanColors.TextTertiary)
+                }
+            },
+            containerColor = RilanColors.SurfaceRaised,
+        )
     }
 }
 
@@ -663,12 +829,20 @@ private fun DigestContent(
     digest: AiDigest,
     digestIsCurrent: Boolean,
     aiConfigured: Boolean,
+    deepseekConfigured: Boolean,
+    summaryMode: SummaryMode,
     onGenerate: () -> Unit,
+    onRegenerateDirect: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val stale = !digestIsCurrent
     val content = digest.content.trim()
     val error = digest.error?.takeIf { it.isNotBlank() }
+    val configured = when (summaryMode) {
+        SummaryMode.MCP -> aiConfigured
+        SummaryMode.DEEPSEEK -> deepseekConfigured
+    }
+    val regenerate = if (summaryMode == SummaryMode.MCP) onGenerate else onRegenerateDirect
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -681,7 +855,7 @@ private fun DigestContent(
         )
 
         if (stale) {
-            StaleNotice(rangeText = digest.rangeText)
+            StaleNotice(rangeText = digest.rangeText, mode = summaryMode)
         }
 
         if (content.isNotEmpty()) {
@@ -697,10 +871,13 @@ private fun DigestContent(
 
         GlassDivider()
 
-        if (stale && aiConfigured) {
+        if (stale && configured) {
             MintButton(
-                text = "如何更新这份总结",
-                onClick = onGenerate,
+                text = when (summaryMode) {
+                    SummaryMode.MCP -> "如何更新这份总结"
+                    SummaryMode.DEEPSEEK -> "用 DeepSeek 重写这段"
+                },
+                onClick = regenerate,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -711,27 +888,32 @@ private fun DigestContent(
         ) {
             Text(
                 text = when {
-                    stale && aiConfigured -> "旧内容会保留，直到新的一份生成完成"
-                    !aiConfigured -> "打开扩展页，让外部 AI 写一份新的"
+                    stale && summaryMode == SummaryMode.MCP -> "旧内容会保留，直到外部 AI 写回新的一份"
+                    stale && summaryMode == SummaryMode.DEEPSEEK -> "旧内容会保留，直到新的一份生成完成"
+                    !configured && summaryMode == SummaryMode.MCP -> "打开扩展页，让外部 AI 写一份新的"
+                    !configured -> "去扩展页填一个 DeepSeek API Key，就能直接生成"
                     content.isEmpty() -> "这次没有生成成功，可以稍后再试"
-                    else -> "内容由 AI 生成，仅供参考"
+                    summaryMode == SummaryMode.DEEPSEEK -> "DeepSeek 直连生成，仅供参考"
+                    else -> "外部 AI 写回，仅供参考"
                 },
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.labelSmall,
                 color = RilanColors.TextTertiary,
             )
-            if (stale && !aiConfigured) {
-                TextAction(text = "打开扩展页", onClick = onOpenSettings)
-            }
-            if (!stale && aiConfigured) {
-                TextAction(text = "如何更新", onClick = onGenerate)
+            if (!configured) {
+                TextAction(text = "去扩展页", onClick = onOpenSettings)
+            } else if (!stale) {
+                TextAction(
+                    text = if (summaryMode == SummaryMode.MCP) "如何更新" else "重新生成",
+                    onClick = regenerate,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun StaleNotice(rangeText: String) {
+private fun StaleNotice(rangeText: String, mode: SummaryMode) {
     val shape = RoundedCornerShape(14.dp)
     Column(
         modifier = Modifier
@@ -743,7 +925,10 @@ private fun StaleNotice(rangeText: String) {
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(
-            text = "这份总结写于更早的时间，生成新的一份？",
+            text = when (mode) {
+                SummaryMode.MCP -> "这份总结写于更早的时间，让外部 AI 写一份新的？"
+                SummaryMode.DEEPSEEK -> "这份总结写于更早的时间，用 DeepSeek 重写这段？"
+            },
             style = MaterialTheme.typography.bodySmall,
             color = RilanColors.Gold,
         )
@@ -758,7 +943,60 @@ private fun StaleNotice(rangeText: String) {
 }
 
 @Composable
-private fun GenerateCta(onGenerate: () -> Unit) {
+private fun SummaryModeSelector(
+    selected: SummaryMode,
+    onSelect: (SummaryMode) -> Unit,
+    enabled: Boolean = true,
+) {
+    val shape = RoundedCornerShape(14.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(RilanColors.GlassWeak)
+            .border(1.dp, Color(0x14FFFFFF), shape)
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        SummaryMode.entries.forEach { mode ->
+            val active = mode == selected
+            val background by animateColorAsState(
+                targetValue = if (active) RilanColors.Mint else Color.Transparent,
+                animationSpec = tween(180),
+                label = "summaryModeBg",
+            )
+            val content by animateColorAsState(
+                targetValue = if (active) MintInk else RilanColors.TextSecondary,
+                animationSpec = tween(180),
+                label = "summaryModeFg",
+            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(11.dp))
+                    .background(background)
+                    .selectable(
+                        selected = active,
+                        enabled = enabled,
+                        role = Role.Tab,
+                        onClick = { if (!active) onSelect(mode) },
+                    )
+                    .padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = mode.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (enabled) content else content.copy(alpha = 0.6f),
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun McpGenerateCta(onGenerate: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             text = "把这段时间的新闻重新读一遍，写成有主线、有变化的一段回顾。",
@@ -771,7 +1009,7 @@ private fun GenerateCta(onGenerate: () -> Unit) {
             modifier = Modifier.fillMaxWidth(),
         )
         Text(
-            text = "在外部 AI 中读取历史记录，再用 save_period_summary 写回；生成消耗外部模型的 token。",
+            text = "在外部 AI 中通过 MCP 读取历史记录，再用 save_period_summary 写回；生成消耗外部模型的 token。",
             style = MaterialTheme.typography.labelSmall,
             color = RilanColors.TextTertiary,
         )
@@ -779,10 +1017,10 @@ private fun GenerateCta(onGenerate: () -> Unit) {
 }
 
 @Composable
-private fun ConnectCta(onOpenSettings: () -> Unit) {
+private fun McpConnectCta(onOpenSettings: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
-            text = "还没有外部 AI 写入总结。启动 MCP 后，在外部 AI 中生成并写回。",
+            text = "还没有外部 AI 写回总结。启动 MCP 后，在外部 AI 中生成并写回。",
             style = MaterialTheme.typography.bodySmall,
             color = RilanColors.TextSecondary,
         )
@@ -793,6 +1031,45 @@ private fun ConnectCta(onOpenSettings: () -> Unit) {
             enabled = false,
         )
         TextAction(text = "打开扩展页", onClick = onOpenSettings)
+    }
+}
+
+@Composable
+private fun DirectGenerateCta(onGenerate: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "用本机收录的内容，让 DeepSeek 直接写成一段有主线的周期回顾。",
+            style = MaterialTheme.typography.bodySmall,
+            color = RilanColors.TextSecondary,
+        )
+        MintButton(
+            text = "用 DeepSeek 生成",
+            onClick = onGenerate,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            text = "生成时会把这段时间的标题、来源和分类发给 DeepSeek；Key 只保存在本机。",
+            style = MaterialTheme.typography.labelSmall,
+            color = RilanColors.TextTertiary,
+        )
+    }
+}
+
+@Composable
+private fun DirectConnectCta(onOpenSettings: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "还没有连接 DeepSeek。在扩展页填一个 API Key，就能在应用内直接生成。",
+            style = MaterialTheme.typography.bodySmall,
+            color = RilanColors.TextSecondary,
+        )
+        MintButton(
+            text = "用 DeepSeek 生成",
+            onClick = {},
+            modifier = Modifier.fillMaxWidth(),
+            enabled = false,
+        )
+        TextAction(text = "去扩展页填 Key", onClick = onOpenSettings)
     }
 }
 
@@ -926,6 +1203,190 @@ private fun TimelineRow(
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 导出收录条目
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ExportSheet(
+    allRecords: List<NewsRecord>,
+    currentRecords: List<NewsRecord>,
+    period: SummaryPeriod,
+    today: LocalDate,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var range by rememberSaveable { mutableStateOf(ExportRange.CURRENT) }
+    var format by rememberSaveable { mutableStateOf(ExportFormat.MARKDOWN) }
+    var exporting by remember { mutableStateOf(false) }
+
+    val source = if (range == ExportRange.CURRENT) currentRecords else allRecords
+    val rangeText = if (range == ExportRange.CURRENT) period.rangeText(today) else ""
+    val fileName = RecordExporter.fileName(range, format, today)
+    val empty = source.isEmpty()
+
+    fun toast(text: String) {
+        Toast.makeText(context, text, Toast.LENGTH_LONG).show()
+    }
+
+    fun startShare(file: java.io.File) {
+        try {
+            context.startActivity(RecordExporter.shareIntent(context, file, format))
+        } catch (t: Throwable) {
+            toast("没有找到可以分享的应用")
+        }
+    }
+
+    fun startExport(shareOnly: Boolean) {
+        if (exporting || empty) return
+        exporting = true
+        scope.launch {
+            try {
+                val outcome = if (shareOnly) {
+                    RecordExporter.prepareForShare(context, source, range, format, rangeText)
+                } else {
+                    RecordExporter.saveToDownloads(context, source, range, format, rangeText)
+                }
+                when (outcome) {
+                    is ExportOutcome.Saved -> {
+                        toast("已保存到 ${outcome.displayPath}")
+                        onDismiss()
+                    }
+                    is ExportOutcome.ShareFallback -> {
+                        toast(
+                            if (shareOnly) {
+                                "已生成 ${outcome.fileName}，选择应用分享"
+                            } else {
+                                "当前系统不能直接写入下载目录，已改为分享文件"
+                            }
+                        )
+                        startShare(outcome.file)
+                        onDismiss()
+                    }
+                    is ExportOutcome.Failed -> toast(outcome.message)
+                }
+            } catch (t: Throwable) {
+                toast("导出失败：${t.message?.takeIf { it.isNotBlank() } ?: "请稍后重试"}")
+            } finally {
+                exporting = false
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 22.dp)
+            .padding(bottom = 30.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        SectionLabel(text = "导出收录条目", accent = RilanColors.Mint)
+        Text(
+            text = "导出的内容来自本机收录记录，字段与回望页看到的一致。",
+            style = MaterialTheme.typography.bodySmall,
+            color = RilanColors.TextSecondary,
+        )
+
+        Text(
+            text = "范围",
+            style = MaterialTheme.typography.labelMedium,
+            color = RilanColors.TextTertiary,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OptionChip(
+                text = "当前周期 · ${currentRecords.size} 条",
+                selected = range == ExportRange.CURRENT,
+                onClick = { range = ExportRange.CURRENT },
+            )
+            OptionChip(
+                text = "全部 · ${allRecords.size} 条",
+                selected = range == ExportRange.ALL,
+                onClick = { range = ExportRange.ALL },
+            )
+        }
+
+        Text(
+            text = "格式",
+            style = MaterialTheme.typography.labelMedium,
+            color = RilanColors.TextTertiary,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ExportFormat.entries.forEach { item ->
+                OptionChip(
+                    text = item.label,
+                    selected = format == item,
+                    onClick = { format = item },
+                )
+            }
+        }
+
+        Text(
+            text = "文件名：$fileName",
+            style = MaterialTheme.typography.labelSmall,
+            color = RilanColors.TextTertiary,
+        )
+        if (empty) {
+            Text(
+                text = "当前范围还没有收录记录，先回日报刷新后再导出。",
+                style = MaterialTheme.typography.bodySmall,
+                color = RilanColors.Gold,
+            )
+        }
+
+        GlassDivider()
+        MintButton(
+            text = if (exporting) "正在导出…" else "保存到下载",
+            onClick = { startExport(shareOnly = false) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !empty && !exporting,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextAction(text = "分享", onClick = { startExport(shareOnly = true) })
+            Spacer(Modifier.weight(1f))
+            TextAction(
+                text = "取消",
+                onClick = onDismiss,
+                color = RilanColors.TextTertiary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun OptionChip(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val background by animateColorAsState(
+        targetValue = if (selected) RilanColors.Mint else ChipIdle,
+        animationSpec = tween(180),
+        label = "optionChipBg",
+    )
+    val content by animateColorAsState(
+        targetValue = if (selected) MintInk else RilanColors.TextSecondary,
+        animationSpec = tween(180),
+        label = "optionChipFg",
+    )
+    Text(
+        text = text,
+        modifier = Modifier
+            .clip(CircleShape)
+            .background(background)
+            .border(1.dp, if (selected) Color.Transparent else Color(0x2BFFFFFF), CircleShape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.labelLarge,
+        color = content,
+        maxLines = 1,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1070,7 +1531,7 @@ private fun digestMeta(digest: AiDigest, current: Boolean): String {
         stamp.isNotBlank() -> "写于 $stamp"
         else -> "生成时间未知"
     }
-    return "$time · ${digest.itemCount} 条素材"
+    return "${digest.sourceLabel} · $time · ${digest.itemCount} 条素材"
 }
 
 private fun dateLabel(date: LocalDate, today: LocalDate): String = when {

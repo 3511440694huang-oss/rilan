@@ -11,7 +11,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -19,6 +22,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.Locale
 import kotlin.coroutines.resume
+import kotlin.math.abs
 
 /** 定位结果：城市、区县和街道分开保存，天气卡可以显示到区县级。 */
 data class PlaceInfo(
@@ -44,16 +48,25 @@ private data class PlaceName(
 /**
  * 系统定位 + 反向地理编码。
  *
- * - 优先用 2 分钟内的系统缓存位置；没有就请求一次当前位置；
- * - 请求失败时退回 24 小时内的旧位置，至少让天气还能按已知经纬度更新；
- * - 反向地理编码先走 BigDataCloud 中文数据，拿到城市、区县和街道；
- * - 区县缺失时再短暂尝试系统 Geocoder，补上街道门牌；
- * - 全部失败时抛 IOException，由仓库展示「定位失败」，不会悄悄用北京。
+ * 速度策略（定位只负责天气，不该让天气等它）：
+ * - 只把「坐标」放在关键路径上：2 分钟内的系统缓存位置 → 现取一次（最多 6 秒）→ 24 小时内的旧位置；
+ * - 区县 / 街道优先读本地缓存（同一点位 24 小时内有效），命中时直接返回，天气立刻开始请求；
+ * - 没有缓存时，关键路径只等 BigDataCloud 2.6 秒；系统 Geocoder 在部分机型上会卡好几秒，
+ *   一律丢到后台补全并写入缓存，下次刷新就能直接复用；
+ * - 坐标拿不到才抛 IOException，由仓库展示「定位失败」，不会悄悄用北京。
  */
 class LocationClient(context: Context) {
 
     private val app = context.applicationContext
     private val manager = app.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+
+    /** 正向地理编码结果的本地缓存：同一点位 24 小时内不必重新请求。 */
+    private val cachePrefs by lazy {
+        app.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
+    }
+
+    /** 后台补全区县 / 街道用的作用域：不阻塞天气，也不跟随页面取消。 */
+    private val refineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun hasPermission(): Boolean =
         ContextCompat.checkSelfPermission(app, Manifest.permission.ACCESS_FINE_LOCATION) ==
@@ -65,18 +78,41 @@ class LocationClient(context: Context) {
         if (!hasPermission()) throw SecurityException("没有定位权限")
         val now = System.currentTimeMillis()
         val lastKnown = lastKnownLocation()
-        val location = lastKnown?.takeIf { now - it.time <= 2 * 60_000L }
+        val location = lastKnown?.takeIf { now - it.time <= LAST_KNOWN_FRESH_MS }
             ?: requestCurrentLocation()
-            ?: lastKnown?.takeIf { now - it.time <= 24 * 60 * 60_000L }
+            ?: lastKnown?.takeIf { now - it.time <= LAST_KNOWN_MAX_AGE_MS }
             ?: throw IOException("无法获取当前位置，请到室外或打开网络定位后重试")
 
-        val named = reverseGeocode(location.latitude, location.longitude)
+        val latitude = location.latitude
+        val longitude = location.longitude
+
+        // 1. 有缓存就先返回：天气可以立刻用这组坐标开始请求，区县 / 街道只影响一行文案。
+        val cached = loadCachedPlace(latitude, longitude)
+        if (cached != null) {
+            return@withContext PlaceInfo(
+                city = cached.city.ifBlank { "当前位置" },
+                district = cached.district,
+                street = cached.street,
+                latitude = latitude,
+                longitude = longitude,
+            )
+        }
+
+        // 2. 没有缓存：关键路径最多等 2.6 秒；正常网络 300–800ms 就会回来。
+        val named = withTimeoutOrNull(NAME_CRITICAL_TIMEOUT_MS) {
+            runCatching { bigDataCloud(latitude, longitude) }.getOrNull()
+        }
+        if (named != null) saveCachedPlace(latitude, longitude, named)
+        if (named == null || named.district.isBlank() || named.street.isBlank()) {
+            // 3. 缺区县 / 街道时后台继续补，补到后写入缓存，下次刷新直接命中。
+            refineNamesInBackground(latitude, longitude)
+        }
         PlaceInfo(
-            city = named.city.ifBlank { "当前位置" },
-            district = named.district,
-            street = named.street,
-            latitude = location.latitude,
-            longitude = location.longitude,
+            city = named?.city?.ifBlank { "当前位置" } ?: "当前位置",
+            district = named?.district.orEmpty(),
+            street = named?.street.orEmpty(),
+            latitude = latitude,
+            longitude = longitude,
         )
     }
 
@@ -104,7 +140,8 @@ class LocationClient(context: Context) {
             else -> return null
         }
 
-        return withTimeoutOrNull(9_000L) {
+        // 6 秒拿不到就先用手上的旧位置，别让天气一直等 GPS 冷启动。
+        return withTimeoutOrNull(LOCATE_TIMEOUT_MS) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 suspendCancellableCoroutine { continuation ->
                     runCatching {
@@ -147,13 +184,53 @@ class LocationClient(context: Context) {
 
     // ── 反向地理编码 ────────────────────────────────────────────────────────
 
-    private suspend fun reverseGeocode(latitude: Double, longitude: Double): PlaceName {
-        val big = bigDataCloud(latitude, longitude)
-        if (big != null && big.district.isNotBlank() && big.street.isNotBlank()) return big
+    /** 关键路径已经返回后再补区县 / 街道：BigDataCloud 慢就再试系统 Geocoder。 */
+    private fun refineNamesInBackground(latitude: Double, longitude: Double) {
+        refineScope.launch {
+            val big = runCatching { bigDataCloud(latitude, longitude) }.getOrNull()
+            var merged: PlaceName? = big
+            if (big == null || big.district.isBlank() || big.street.isBlank()) {
+                val system = withTimeoutOrNull(SYSTEM_GEOCODE_TIMEOUT_MS) {
+                    runCatching { systemGeocoder(latitude, longitude) }.getOrNull()
+                }
+                merged = merge(big, system)
+            }
+            if (merged != null) saveCachedPlace(latitude, longitude, merged)
+        }
+    }
 
-        // 系统 Geocoder 在部分机型上又慢又可能阻塞，只给 2.5 秒用它补区县 / 街道。
-        val system = withTimeoutOrNull(2_500L) { systemGeocoder(latitude, longitude) }
-        return merge(big, system) ?: PlaceName(city = "当前位置")
+    // ── 区县 / 街道缓存 ────────────────────────────────────────────────────
+
+    private fun loadCachedPlace(latitude: Double, longitude: Double): PlaceName? {
+        val raw = cachePrefs.getString(CACHE_KEY, null) ?: return null
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        val savedAt = root.optLong("savedAt", 0L)
+        if (System.currentTimeMillis() - savedAt > CACHE_TTL_MS) return null
+        val cachedLat = root.optDouble("latitude", Double.NaN)
+        val cachedLng = root.optDouble("longitude", Double.NaN)
+        if (!cachedLat.isFinite() || !cachedLng.isFinite()) return null
+        if (abs(cachedLat - latitude) > CACHE_MAX_DISTANCE_DEG) return null
+        if (abs(cachedLng - longitude) > CACHE_MAX_DISTANCE_DEG) return null
+        val place = PlaceName(
+            city = root.optString("city").trim(),
+            district = root.optString("district").trim(),
+            street = root.optString("street").trim(),
+        )
+        return place.takeIf { it.city.isNotBlank() || it.district.isNotBlank() }
+    }
+
+    private fun saveCachedPlace(latitude: Double, longitude: Double, place: PlaceName) {
+        if (place.city.isBlank() && place.district.isBlank()) return
+        runCatching {
+            val root = JSONObject()
+                .put("city", place.city)
+                .put("district", place.district)
+                .put("street", place.street)
+                .put("latitude", latitude)
+                .put("longitude", longitude)
+                .put("savedAt", System.currentTimeMillis())
+            cachePrefs.edit().putString(CACHE_KEY, root.toString()).apply()
+        }
     }
 
     private suspend fun bigDataCloud(latitude: Double, longitude: Double): PlaceName? {
@@ -284,5 +361,26 @@ class LocationClient(context: Context) {
             .removeSuffix("特别行政区")
             .removeSuffix("自治区")
             .trim()
+    }
+
+    private companion object {
+        const val CACHE_PREFS = "rilan_location_cache"
+        const val CACHE_KEY = "place_v1"
+        const val CACHE_TTL_MS = 24 * 60 * 60_000L
+
+        /** 约 2 公里；同一区的缓存可以直接复用。 */
+        const val CACHE_MAX_DISTANCE_DEG = 0.02
+
+        const val LAST_KNOWN_FRESH_MS = 2 * 60_000L
+        const val LAST_KNOWN_MAX_AGE_MS = 24 * 60 * 60_000L
+
+        /** 现取坐标最多等 6 秒；再久就先用手上的旧位置。 */
+        const val LOCATE_TIMEOUT_MS = 6_000L
+
+        /** 关键路径上给反向地理编码的时间：正常 300–800ms，慢网也要在 2.6 秒内放弃。 */
+        const val NAME_CRITICAL_TIMEOUT_MS = 2_600L
+
+        /** 后台补系统 Geocoder 的时限。 */
+        const val SYSTEM_GEOCODE_TIMEOUT_MS = 2_500L
     }
 }

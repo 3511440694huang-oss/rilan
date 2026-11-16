@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.DailyWeather
@@ -62,7 +63,6 @@ import kotlin.math.roundToInt
 
 private val DAY_LABEL = DateTimeFormatter.ofPattern("M/d")
 private val WEEK_LABELS = listOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-private val WEATHER_BOTTOM_INSET = 96.dp
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 天气主卡：一张透着天色的玻璃窗
@@ -80,6 +80,8 @@ internal fun WeatherHero(
     onRefresh: () -> Unit,
     onRelocate: () -> Unit,
     sheen: Float = 0.4f,
+    scrolling: Boolean = false,
+    bottomInset: Dp = 96.dp,
     modifier: Modifier = Modifier,
 ) {
     GlassCard(
@@ -87,6 +89,7 @@ internal fun WeatherHero(
         shape = RoundedCornerShape(32.dp),
         strong = true,
         refraction = true,
+        scrolling = scrolling,
         sheen = sheen,
         contentPadding = PaddingValues(0.dp),
     ) {
@@ -96,7 +99,7 @@ internal fun WeatherHero(
                 Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = WEATHER_BOTTOM_INSET),
+                    .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = bottomInset),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 WeatherTop(
@@ -105,9 +108,19 @@ internal fun WeatherHero(
                     refreshing = refreshing,
                     locating = locating,
                     locationError = locationError,
+                    scrolling = scrolling,
                     onRelocate = onRelocate,
                 )
-                if (error != null) ErrorLine(error)
+                if (error != null) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ErrorLine(error, Modifier.weight(1f))
+                        Spacer(Modifier.width(8.dp))
+                        TextAction("重试", onRefresh, color = RilanColors.Dawn)
+                    }
+                }
                 when {
                     weather == null && loading -> WeatherSkeleton()
                     weather == null -> WeatherMissing(onRefresh = onRefresh)
@@ -163,6 +176,7 @@ private fun WeatherTop(
     refreshing: Boolean,
     locating: Boolean,
     locationError: String?,
+    scrolling: Boolean,
     onRelocate: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -195,17 +209,23 @@ private fun WeatherTop(
 
             Spacer(Modifier.height(7.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                val pinPulse = rememberInfiniteTransition(label = "pin")
-                val pinAlpha by pinPulse.animateFloat(
-                    0.45f, 1f,
-                    infiniteRepeatable(tween(1600, easing = LinearEasing), RepeatMode.Reverse),
-                    label = "pinAlpha",
-                )
+                // 只有正在定位时才跑无限脉冲；平时用固定透明度，省掉每帧一次重组。
+                val pinAlpha = if (locating) {
+                    val pinPulse = rememberInfiniteTransition(label = "pin")
+                    val value by pinPulse.animateFloat(
+                        0.45f, 1f,
+                        infiniteRepeatable(tween(1600, easing = LinearEasing), RepeatMode.Reverse),
+                        label = "pinAlpha",
+                    )
+                    value
+                } else {
+                    0.9f
+                }
                 Box(
                     Modifier
                         .size(5.dp)
                         .clip(CircleShape)
-                        .background(RilanColors.Moon.copy(alpha = if (locating) pinAlpha else 0.9f))
+                        .background(RilanColors.Moon.copy(alpha = pinAlpha))
                 )
                 Spacer(Modifier.width(7.dp))
                 Text(
@@ -243,9 +263,10 @@ private fun WeatherTop(
         }
         Spacer(Modifier.width(10.dp))
         if (weather != null) {
-            WeatherGlyph(
+            HeroWeatherGlyph(
                 code = weather.weatherCode,
                 isDay = weather.isDay,
+                scrolling = scrolling,
                 modifier = Modifier.size(92.dp),
             )
         } else {
@@ -257,6 +278,24 @@ private fun WeatherTop(
                     .border(0.75.dp, Color.White.copy(alpha = 0.10f), CircleShape)
             )
         }
+    }
+}
+
+/**
+ * 天气大图标：静止时用带光线旋转的动态版，横向滑动中换成同样笔触的静态版。
+ * 无限动画会让整张卡片的绘制层每帧重录，翻页时这是最贵的一块。
+ */
+@Composable
+private fun HeroWeatherGlyph(
+    code: Int,
+    isDay: Boolean,
+    scrolling: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (scrolling) {
+        WeatherMiniGlyph(code = code, isDay = isDay, modifier = modifier)
+    } else {
+        WeatherGlyph(code = code, isDay = isDay, modifier = modifier)
     }
 }
 
@@ -407,7 +446,8 @@ private fun HourCell(
             color = RilanColors.TextTertiary,
             maxLines = 1,
         )
-        WeatherGlyph(
+        // 小时条目的图标用静态绘制：7 天 × 12 小时十多个无限动画是滑动卡顿的主因之一。
+        WeatherMiniGlyph(
             code = hour.code,
             isDay = true,
             modifier = Modifier.size(24.dp),
@@ -445,7 +485,7 @@ private fun DailyStrip(days: List<DailyWeather>) {
                     color = RilanColors.TextTertiary,
                     maxLines = 1,
                 )
-                WeatherGlyph(
+                WeatherMiniGlyph(
                     code = day.code,
                     isDay = true,
                     modifier = Modifier.size(22.dp),

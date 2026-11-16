@@ -41,8 +41,24 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- 收录条目导出：API 26–28 用 FileProvider 分享 cache/exports 里的文件。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <receiver
             android:name=".schedule.ReminderReceiver"
+            android:exported="false" />
+
+        <!-- 每日简报：每天固定时刻由 AlarmManager 的非精确重复闹钟触发。 -->
+        <receiver
+            android:name=".schedule.DailyBriefReceiver"
             android:exported="false" />
 
         <receiver

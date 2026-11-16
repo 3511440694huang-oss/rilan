@@ -13,6 +13,7 @@ import app.rilan.daily.core.HomeState
 import app.rilan.daily.core.NewsRecord
 import app.rilan.daily.core.ScheduleEvent
 import app.rilan.daily.core.SettingsUiState
+import app.rilan.daily.core.SummaryMode
 import app.rilan.daily.core.SummaryPeriod
 import app.rilan.daily.mcp.McpServerState
 import app.rilan.daily.mcp.McpTestState
@@ -31,6 +32,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val schedules: StateFlow<List<ScheduleEvent>> = repo.schedules
     val records: StateFlow<List<NewsRecord>> = repo.records
     val digests: StateFlow<Map<SummaryPeriod, AiDigest>> = repo.digests
+    /** DeepSeek 直连正在生成的周期；null 表示空闲。 */
+    val summaryLoading: StateFlow<SummaryPeriod?> = repo.summaryLoading
     val cityResults = repo.cityResults
     val mcpState: StateFlow<McpServerState> = repo.mcpState
     val mcpTest: StateFlow<McpTestState> = repo.mcpTest
@@ -78,6 +81,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun clearAiContent() = repo.clearAiCaches()
 
     fun generateDailyBrief() = repo.generateDailyBrief()
+
+    fun setSummaryMode(mode: SummaryMode) = repo.setSummaryMode(mode)
+
+    /** 周期总结：用 DeepSeek API Key 直连生成，写回与 MCP 相同的 digest。 */
+    fun generatePeriodSummaryDirect(period: SummaryPeriod) =
+        repo.generatePeriodSummaryDirect(period)
 
     fun testDeepSeek(apiKey: String, model: String) = repo.testDeepSeek(apiKey, model)
 

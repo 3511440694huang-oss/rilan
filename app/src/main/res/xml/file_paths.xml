@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 只暴露 cache/exports 下的导出文件，不暴露应用其他数据。 -->
+<paths>
+    <cache-path name="exports" path="exports/" />
+</paths>

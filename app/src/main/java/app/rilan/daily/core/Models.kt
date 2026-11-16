@@ -289,6 +289,20 @@ enum class SummaryPeriod(val label: String, val days: Int) {
     fun key(today: LocalDate = LocalDate.now()): String = "${name}-$today"
 }
 
+/**
+ * 周期总结的生成方式：外部 AI 通过 MCP 写回，或应用内用 DeepSeek API Key 直连生成。
+ * 默认 MCP，保持旧安装升级后的行为不变。
+ */
+enum class SummaryMode(val label: String) {
+    MCP("MCP 写回"),
+    DEEPSEEK("DeepSeek 直连");
+
+    companion object {
+        fun parse(value: String?): SummaryMode =
+            entries.firstOrNull { it.name.equals(value, true) } ?: MCP
+    }
+}
+
 data class AiDigest(
     val period: SummaryPeriod,
     val key: String,
@@ -297,7 +311,17 @@ data class AiDigest(
     val itemCount: Int,
     val createdAt: Long,
     val error: String? = null,
-)
+    /** 来源：mcp = 外部 AI 写回；deepseek = 应用内直连生成。旧数据默认 mcp。 */
+    val source: String = SOURCE_MCP,
+) {
+    val sourceLabel: String
+        get() = if (source == SOURCE_DEEPSEEK) "DeepSeek 直连" else "外部 AI 写回"
+
+    companion object {
+        const val SOURCE_MCP = "mcp"
+        const val SOURCE_DEEPSEEK = "deepseek"
+    }
+}
 
 enum class ChatRole { USER, ASSISTANT }
 
@@ -328,6 +352,12 @@ data class AppSettings(
     val longitude: Double = 116.4074,
     val timezone: String = "Asia/Shanghai",
     val reminderMinuteOfDay: Int = 8 * 60 + 30,
+    /** 每日简报通知：默认关闭（opt-in），用户打开后按 [dailyNoticeMinuteOfDay] 每天发一条。 */
+    val dailyNoticeEnabled: Boolean = false,
+    /** 每日简报时间，当天第几分钟（默认 08:00 = 480）。 */
+    val dailyNoticeMinuteOfDay: Int = 8 * 60,
+    /** 开机自启动：开机 / 应用更新后恢复后台服务与每日通知，不直接打开界面。 */
+    val autoStartEnabled: Boolean = false,
     val feeds: List<FeedSource> = FeedSource.DEFAULTS,
     val blockedWords: List<String> = emptyList(),
     val lastWeatherAt: Long = 0L,
@@ -345,9 +375,14 @@ data class AppSettings(
     /** DeepSeek API Key，只保存在应用私有 SharedPreferences，不写日志、不上云。 */
     val deepseekApiKey: String = "",
     val deepseekModel: String = "deepseek-flash",
+    /** 周期总结的生成方式，见 [SummaryMode]；默认 MCP 写回。 */
+    val summaryMode: SummaryMode = SummaryMode.MCP,
 ) {
     val reminderLabel: String
         get() = "%02d:%02d".format(reminderMinuteOfDay / 60, reminderMinuteOfDay % 60)
+
+    val dailyNoticeLabel: String
+        get() = "%02d:%02d".format(dailyNoticeMinuteOfDay / 60, dailyNoticeMinuteOfDay % 60)
 
     val deepseekConfigured: Boolean get() = deepseekApiKey.isNotBlank()
 }

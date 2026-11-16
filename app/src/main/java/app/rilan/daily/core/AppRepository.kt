@@ -17,12 +17,15 @@ import app.rilan.daily.mcp.McpService
 import app.rilan.daily.mcp.RilanMcpServer
 import app.rilan.daily.plugins.SourcePlugin
 import app.rilan.daily.plugins.SourcePluginStore
+import app.rilan.daily.schedule.DailyBriefNotifier
 import app.rilan.daily.schedule.NotificationHelper
 import app.rilan.daily.schedule.Recurrence
 import app.rilan.daily.schedule.ReminderScheduler
 import app.rilan.daily.schedule.ScheduleStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
@@ -33,6 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -65,6 +69,10 @@ class AppRepository(context: Context) : McpHost {
 
     private val _digests = MutableStateFlow(prefs.loadDigests())
     val digests: StateFlow<Map<SummaryPeriod, AiDigest>> = _digests.asStateFlow()
+
+    /** 正在用 DeepSeek 直连生成的周期；null 表示空闲。 */
+    private val _summaryLoading = MutableStateFlow<SummaryPeriod?>(null)
+    val summaryLoading: StateFlow<SummaryPeriod?> = _summaryLoading.asStateFlow()
 
     private val _cityResults = MutableStateFlow<List<CityResult>>(emptyList())
     val cityResults: StateFlow<List<CityResult>> = _cityResults.asStateFlow()
@@ -102,6 +110,7 @@ class AppRepository(context: Context) : McpHost {
     @Volatile private var contentJob: Job? = null
     @Volatile private var wallpaperJob: Job? = null
     @Volatile private var aiJob: Job? = null
+    @Volatile private var summaryJob: Job? = null
     private val bootstrapped = AtomicBoolean(false)
 
     init {
@@ -119,9 +128,18 @@ class AppRepository(context: Context) : McpHost {
         if (!bootstrapped.compareAndSet(false, true)) return
         NotificationHelper.ensureChannels(appContext)
         ReminderScheduler.ensureDaily(appContext)
+        // 每日简报以 AppSettings 为准同步一次闹钟：升级 / 首次启动后设置与已注册闹钟不打架。
+        val current = _settings.value
+        DailyBriefNotifier.schedule(
+            appContext,
+            current.dailyNoticeEnabled,
+            current.dailyNoticeMinuteOfDay / 60,
+            current.dailyNoticeMinuteOfDay % 60,
+        )
         refreshDailyAiForToday()
         scope.launch {
-            refreshWallpaperIfStale()
+            // 壁纸、天气、信息流互不阻塞：壁纸最慢，不能挡在天气前面。
+            launch { refreshWallpaperIfStale() }
             if (isWeatherStale()) refreshWeather()
             if (isContentStale()) triggerContentRefresh()
         }
@@ -163,12 +181,12 @@ class AppRepository(context: Context) : McpHost {
 
     private fun isWeatherStale(): Boolean {
         val last = _settings.value.lastWeatherAt
-        return last <= 0L || System.currentTimeMillis() - last > 5 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > 3 * 60_000L
     }
 
     private fun isContentStale(): Boolean {
         val last = _settings.value.lastContentAt
-        return last <= 0L || System.currentTimeMillis() - last > 8 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > 6 * 60_000L
     }
 
     fun refreshWeather() {
@@ -211,20 +229,41 @@ class AppRepository(context: Context) : McpHost {
 
     private fun isLocationStale(): Boolean {
         val last = _settings.value.lastLocationAt
-        return last <= 0L || System.currentTimeMillis() - last > 10 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > 30 * 60_000L
     }
 
     private fun refreshWeatherInternal(forceLocate: Boolean) {
         if (weatherJob?.isActive == true) return
         weatherJob = scope.launch {
             beginRefresh()
+            var early: Deferred<WeatherData>? = null
             try {
                 val settings = _settings.value
-                if (settings.autoLocation && locationClient.hasPermission() &&
-                    (forceLocate || isLocationStale())
-                ) {
+                val auto = settings.autoLocation
+                val permitted = locationClient.hasPermission()
+
+                if (auto && !permitted && settings.lastLocationAt <= 0L) {
+                    _home.update {
+                        it.copy(
+                            locating = false,
+                            locationError = "未开启定位权限",
+                            weatherError = "开启定位，或到设置里手动选择城市",
+                            loading = false,
+                        )
+                    }
+                    return@launch
+                }
+
+                // 先用上次坐标（或手动城市）立刻拉天气；定位与区县反查在下面并行补，
+                // 位置服务慢时不再把天气卡在 loading 里十几秒。
+                if (!auto || settings.lastLocationAt > 0L) {
+                    early = async { weatherClient.fetch(settings) }
+                }
+
+                var place: PlaceInfo? = null
+                if (auto && permitted && (forceLocate || isLocationStale())) {
                     _home.update { it.copy(locating = true, locationError = null) }
-                    val place = withTimeoutOrNull(16_000L) {
+                    place = withTimeoutOrNull(8_000L) {
                         runCatching { locationClient.currentPlace() }.getOrNull()
                     }
                     if (place != null) {
@@ -240,12 +279,17 @@ class AppRepository(context: Context) : McpHost {
                             )
                         }
                         // 从没定位成功过时不要拿默认坐标（北京）冒充当前位置
-                        if (settings.lastLocationAt <= 0L) return@launch
+                        if (settings.lastLocationAt <= 0L) {
+                            early?.cancel()
+                            _home.update { it.copy(loading = false) }
+                            return@launch
+                        }
                     }
-                } else if (settings.autoLocation && !locationClient.hasPermission()) {
+                } else if (auto && !permitted) {
                     _home.update { it.copy(locating = false, locationError = "未开启定位权限") }
                     // 从未定位成功过时，不用「北京」这种默认坐标冒充当前位置
                     if (settings.lastLocationAt <= 0L) {
+                        early?.cancel()
                         _home.update {
                             it.copy(
                                 weatherError = "开启定位，或到设置里手动选择城市",
@@ -256,11 +300,26 @@ class AppRepository(context: Context) : McpHost {
                     }
                 }
 
-                val data = weatherClient.fetch(_settings.value)
-                prefs.saveWeatherCache(data)
+                val located = place
+                val moved = located != null && (
+                    abs(located.latitude - settings.latitude) > 1e-4 ||
+                        abs(located.longitude - settings.longitude) > 1e-4
+                    )
+                var data: WeatherData? = null
+                val pending = early
+                if (pending != null) {
+                    if (moved) {
+                        // 位置变了，旧坐标的天气作废，换新坐标再拉一次
+                        pending.cancel()
+                    } else {
+                        data = pending.await()
+                    }
+                }
+                val fresh = data ?: weatherClient.fetch(_settings.value)
+                prefs.saveWeatherCache(fresh)
                 _home.update {
                     it.copy(
-                        weather = data,
+                        weather = fresh,
                         weatherError = null,
                         loading = false,
                         lastUpdated = maxOf(it.lastUpdated, System.currentTimeMillis()),
@@ -268,8 +327,10 @@ class AppRepository(context: Context) : McpHost {
                 }
                 mutateSettings { it.copy(lastWeatherAt = System.currentTimeMillis()) }
             } catch (cancel: CancellationException) {
+                early?.cancel()
                 throw cancel
             } catch (t: Throwable) {
+                early?.cancel()
                 _home.update {
                     it.copy(
                         weatherError = friendlyError(t),
@@ -387,6 +448,8 @@ class AppRepository(context: Context) : McpHost {
             sanitized.latitude != old.latitude ||
             sanitized.longitude != old.longitude
         val reminderChanged = sanitized.reminderMinuteOfDay != old.reminderMinuteOfDay
+        val dailyNoticeChanged = sanitized.dailyNoticeEnabled != old.dailyNoticeEnabled ||
+            sanitized.dailyNoticeMinuteOfDay != old.dailyNoticeMinuteOfDay
         val autoLocationChanged = sanitized.autoLocation != old.autoLocation
         val aiChanged = sanitized.deepseekApiKey != old.deepseekApiKey ||
             sanitized.deepseekModel != old.deepseekModel
@@ -416,6 +479,15 @@ class AppRepository(context: Context) : McpHost {
         }
         if (reminderChanged) {
             ReminderScheduler.reschedule(appContext, normalized.reminderMinuteOfDay)
+        }
+        // 每日简报开关 / 时间变化后立刻重挂闹钟（设置本身已由 mutateSettings 持久化）。
+        if (dailyNoticeChanged) {
+            DailyBriefNotifier.schedule(
+                appContext,
+                normalized.dailyNoticeEnabled,
+                normalized.dailyNoticeMinuteOfDay / 60,
+                normalized.dailyNoticeMinuteOfDay % 60,
+            )
         }
     }
 
@@ -457,6 +529,9 @@ class AppRepository(context: Context) : McpHost {
     fun clearAiCaches() {
         aiJob?.cancel()
         aiJob = null
+        summaryJob?.cancel()
+        summaryJob = null
+        _summaryLoading.value = null
         prefs.clearAiCaches()
         _home.update { it.copy(weatherInsight = AiText(), dailyBrief = AiText()) }
         _digests.value = emptyMap()
@@ -631,6 +706,135 @@ class AppRepository(context: Context) : McpHost {
         const val DAILY_BRIEF_SYSTEM =
             "你是「日览」的中文编辑，擅长把碎片信息收拢成一天的主线。" +
                 "语气克制、具体、不空泛；只输出正文，不解释你的写作过程。"
+
+        const val PERIOD_SUMMARY_SYSTEM =
+            "你是「日览」的中文编辑，擅长从一个人的阅读收录里找到一段时间的脉络与变化。" +
+                "语气克制、具体、不空泛；只使用材料里的事实；只输出正文，不解释你的写作过程。"
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // DeepSeek 直连：周期总结（与 MCP 写回共用同一份 _digests）
+    // ────────────────────────────────────────────────────────────────────────
+
+    /** 切换周期总结的生成方式，并立即持久化。 */
+    fun setSummaryMode(mode: SummaryMode) {
+        if (_settings.value.summaryMode == mode) return
+        mutateSettings { it.copy(summaryMode = mode) }
+    }
+
+    /**
+     * 用本机真实的收录记录拼提示词，调用 DeepSeek 直连生成周期总结，写回与 MCP 相同的 _digests。
+     * 失败时把中文错误写进 AiDigest.error，保留旧内容，不抛给界面。
+     */
+    fun generatePeriodSummaryDirect(period: SummaryPeriod) {
+        if (summaryJob?.isActive == true) return
+        val settings = _settings.value
+        val today = LocalDate.now()
+        if (!settings.deepseekConfigured) {
+            updateDigest(
+                AiDigest(
+                    period = period,
+                    key = period.key(today),
+                    rangeText = period.rangeText(today),
+                    content = _digests.value[period]?.content.orEmpty(),
+                    itemCount = _digests.value[period]?.itemCount ?: 0,
+                    createdAt = System.currentTimeMillis(),
+                    error = "还没有填写 DeepSeek API Key，先到扩展页连接 DeepSeek。",
+                    source = AiDigest.SOURCE_DEEPSEEK,
+                )
+            )
+            return
+        }
+
+        summaryJob = scope.launch {
+            _summaryLoading.value = period
+            val items = recordsFor(period.startDate(today), today)
+            try {
+                if (items.isEmpty()) {
+                    throw IllegalStateException("这段时间还没有收录记录，先去日报刷新几次再生成。")
+                }
+                val content = deepSeekClient.complete(
+                    apiKey = settings.deepseekApiKey,
+                    model = settings.deepseekModel,
+                    system = PERIOD_SUMMARY_SYSTEM,
+                    user = buildPeriodSummaryPrompt(period, today, items),
+                    maxTokens = 1_800,
+                ).trim().take(12_000)
+
+                updateDigest(
+                    AiDigest(
+                        period = period,
+                        key = period.key(today),
+                        rangeText = period.rangeText(today),
+                        content = content,
+                        itemCount = items.size,
+                        createdAt = System.currentTimeMillis(),
+                        source = AiDigest.SOURCE_DEEPSEEK,
+                    )
+                )
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (t: Throwable) {
+                val old = _digests.value[period]
+                updateDigest(
+                    AiDigest(
+                        period = period,
+                        key = period.key(today),
+                        rangeText = period.rangeText(today),
+                        content = old?.content.orEmpty(),
+                        itemCount = items.size,
+                        createdAt = old?.createdAt?.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                        error = t.message?.takeIf { it.isNotBlank() } ?: "生成失败，请稍后重试",
+                        source = AiDigest.SOURCE_DEEPSEEK,
+                    )
+                )
+            } finally {
+                _summaryLoading.value = null
+            }
+        }
+    }
+
+    /** 只把真实记录交给模型；按天分组，附分类与来源，明确禁止编造。 */
+    private fun buildPeriodSummaryPrompt(
+        period: SummaryPeriod,
+        today: LocalDate,
+        items: List<NewsRecord>,
+    ): String {
+        val zone = ZoneId.systemDefault()
+        val dateFormat = DateTimeFormatter.ofPattern("M月d日")
+        val shown = items.sortedByDescending { it.firstSeenAt }.take(260)
+        val byDate = shown.groupBy {
+            Instant.ofEpochMilli(it.firstSeenAt).atZone(zone).toLocalDate()
+        }.toSortedMap(compareByDescending { it })
+
+        val prompt = StringBuilder(8_000)
+        prompt.appendLine("周期：${period.label}（${period.rangeText(today)}）")
+        prompt.appendLine("素材：本机收录的 ${items.size} 条记录，按首次收录时间归档；只能使用这些事实。")
+        prompt.appendLine()
+        byDate.forEach { (date, records) ->
+            prompt.appendLine("【${date.format(dateFormat)}】")
+            records.forEach { record ->
+                val source = record.source.takeIf { it.isNotBlank() } ?: "未知来源"
+                prompt.appendLine("- [${record.category.label}] $source：${record.title.take(160)}")
+            }
+            prompt.appendLine()
+        }
+        if (items.size > shown.size) {
+            prompt.appendLine("（另有 ${items.size - shown.size} 条较早记录未列出）")
+            prompt.appendLine()
+        }
+        prompt.appendLine(
+            """
+            请基于以上材料，用中文写这段时间的回顾总结。要求：
+            1. 开头用一句话概括这段时间的主线，不超过 45 字。
+            2. 用 **看什么** 列出 3–5 条最值得记住的事，每条一句话，尽量注明大概日期或来源。
+            3. 用 **趋势与变化** 写 2–4 句：哪些话题反复出现、关注点怎么移动。
+            4. 用 **给你的提醒** 写 1–3 条基于这些内容的行动建议。
+            5. 只能使用材料里的事实，不要编造、不要补充材料以外的知识；材料不足就直接说“这段时间收录的内容还不够”。
+            6. 不要一级标题，不要表格，不要寒暄，全文 400–700 字。
+            """.trimIndent()
+        )
+        return prompt.toString().take(12_000)
     }
 
     fun savePlugin(rawJson: String, originalId: String? = null): String? {
@@ -1189,6 +1393,7 @@ class AppRepository(context: Context) : McpHost {
             content = text,
             itemCount = recordsFor(summaryPeriod.startDate(today), today).size,
             createdAt = System.currentTimeMillis(),
+            source = AiDigest.SOURCE_MCP,
         )
         updateDigest(digest)
         return JSONObject().apply {

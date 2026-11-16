@@ -6,10 +6,13 @@ import app.rilan.daily.core.CityResult
 import app.rilan.daily.core.DailyWeather
 import app.rilan.daily.core.HourlyWeather
 import app.rilan.daily.core.WeatherData
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -33,69 +36,78 @@ import java.util.concurrent.CancellationException
  */
 class WeatherClient {
 
+    /**
+     * 空气质量是可选模块：放进独立作用域并行拉取。
+     *
+     * 之前 air 和天气在同一个 coroutineScope 里，`await` 即使超时也会被结构化并发
+     * 拖到子任务结束，空气慢 5–7 秒就等于天气慢 5–7 秒。现在只等 [AIR_WAIT_MS]，
+     * 等不到就丢掉这一小块数据，天气照常成功返回。
+     */
+    private val optionalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     suspend fun fetch(settings: AppSettings): WeatherData = withContext(Dispatchers.IO) {
-        // 空气质量只影响一小块信息，和主天气并行拉；主天气返回后不必再等它。
-        coroutineScope {
-            val airDeferred = async { fetchAir(settings) }
-            val root = json(
-                forecastUrl(settings),
-                "获取天气失败",
-                connectTimeoutMs = 10_000,
-                readTimeoutMs = 30_000,
-            )
-            val current = root.optJSONObject("current")
-            if (current == null || !current.has("temperature_2m")) {
-                throw IOException("天气数据不完整，请稍后重试")
-            }
-
-            val zone = resolveZone(root, settings)
-            val now = ZonedDateTime.now(zone)
-            val today = now.toLocalDate()
-            val todayKey = today.toString()
-            val yesterdayKey = today.minusDays(1).toString()
-
-            // daily 带 past_days=1：昨天 + 今天 + 未来 6 天，共 8 条
-            val daily = parseDaily(root.optJSONObject("daily"))
-            val todayDaily = daily.firstOrNull { it.date == todayKey }
-            val yesterdayDaily = daily.firstOrNull { it.date == yesterdayKey }
-            val hourly = parseHourly(root.optJSONObject("hourly"), now.toLocalDateTime())
-
-            // 空气质量是锦上添花，任何失败都吞掉，不影响天气
-            val air = try {
-                airDeferred.await()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                null
-            }
-
-            val temp = current.optDouble("temperature_2m", 0.0)
-            WeatherData(
-                city = settings.city,
-                place = settings.place,
-                updatedAt = System.currentTimeMillis(),
-                currentTemp = temp,
-                feelsLike = current.optDouble("apparent_temperature", temp),
-                humidity = current.optInt("relative_humidity_2m", 0),
-                windSpeed = current.optDouble("wind_speed_10m", 0.0),
-                windDirection = current.optInt("wind_direction_10m", 0),
-                weatherCode = current.optInt("weather_code", -1),
-                isDay = current.optInt("is_day", 1) != 0,
-                // 今日高低温取 daily 里今天的条目（past_days 让昨天也可用，日界不会被跨时区算错）
-                high = todayDaily?.high ?: temp,
-                low = todayDaily?.low ?: temp,
-                yesterdayHigh = yesterdayDaily?.high,
-                yesterdayLow = yesterdayDaily?.low,
-                precipProb = todayDaily?.precipProb ?: 0,
-                uvIndex = todayDaily?.uvIndex ?: 0.0,
-                sunrise = todayDaily?.sunrise.orEmpty(),
-                sunset = todayDaily?.sunset.orEmpty(),
-                hourly = hourly,
-                // 对外只暴露今天起的 7 天；昨天只用来算昨天对比
-                daily = daily.filter { it.date >= todayKey }.take(FORECAST_DAYS),
-                air = air,
-            )
+        val airJob = optionalScope.async { runCatching { fetchAir(settings) }.getOrNull() }
+        try {
+            val data = fetchForecast(settings)
+            val air = withTimeoutOrNull(AIR_WAIT_MS) { airJob.await() }
+            if (air == null) airJob.cancel()
+            if (air != null) data.copy(air = air) else data
+        } catch (t: Throwable) {
+            airJob.cancel()
+            throw t
         }
+    }
+
+    private suspend fun fetchForecast(settings: AppSettings): WeatherData {
+        val root = json(
+            forecastUrl(settings),
+            "获取天气失败",
+            connectTimeoutMs = CONNECT_TIMEOUT_MS,
+            readTimeoutMs = READ_TIMEOUT_MS,
+        )
+        val current = root.optJSONObject("current")
+        if (current == null || !current.has("temperature_2m")) {
+            throw IOException("天气数据不完整，请稍后重试")
+        }
+
+        val zone = resolveZone(root, settings)
+        val now = ZonedDateTime.now(zone)
+        val today = now.toLocalDate()
+        val todayKey = today.toString()
+        val yesterdayKey = today.minusDays(1).toString()
+
+        // daily 带 past_days=1：昨天 + 今天 + 未来 6 天，共 8 条
+        val daily = parseDaily(root.optJSONObject("daily"))
+        val todayDaily = daily.firstOrNull { it.date == todayKey }
+        val yesterdayDaily = daily.firstOrNull { it.date == yesterdayKey }
+        val hourly = parseHourly(root.optJSONObject("hourly"), now.toLocalDateTime())
+
+        val temp = current.optDouble("temperature_2m", 0.0)
+        return WeatherData(
+            city = settings.city,
+            place = settings.place,
+            updatedAt = System.currentTimeMillis(),
+            currentTemp = temp,
+            feelsLike = current.optDouble("apparent_temperature", temp),
+            humidity = current.optInt("relative_humidity_2m", 0),
+            windSpeed = current.optDouble("wind_speed_10m", 0.0),
+            windDirection = current.optInt("wind_direction_10m", 0),
+            weatherCode = current.optInt("weather_code", -1),
+            isDay = current.optInt("is_day", 1) != 0,
+            // 今日高低温取 daily 里今天的条目（past_days 让昨天也可用，日界不会被跨时区算错）
+            high = todayDaily?.high ?: temp,
+            low = todayDaily?.low ?: temp,
+            yesterdayHigh = yesterdayDaily?.high,
+            yesterdayLow = yesterdayDaily?.low,
+            precipProb = todayDaily?.precipProb ?: 0,
+            uvIndex = todayDaily?.uvIndex ?: 0.0,
+            sunrise = todayDaily?.sunrise.orEmpty(),
+            sunset = todayDaily?.sunset.orEmpty(),
+            hourly = hourly,
+            // 对外只暴露今天起的 7 天；昨天只用来算昨天对比
+            daily = daily.filter { it.date >= todayKey }.take(FORECAST_DAYS),
+            air = null,
+        )
     }
 
     suspend fun searchCity(query: String): List<CityResult> = withContext(Dispatchers.IO) {
@@ -106,8 +118,8 @@ class WeatherClient {
             "https://geocoding-api.open-meteo.com/v1/search?name=${urlEncode(keyword)}" +
                 "&count=6&language=zh&format=json",
             "搜索城市失败",
-            connectTimeoutMs = 8_000,
-            readTimeoutMs = 12_000,
+            connectTimeoutMs = 6_000,
+            readTimeoutMs = 10_000,
         )
         val root = try {
             JSONObject(body)
@@ -146,8 +158,8 @@ class WeatherClient {
     private suspend fun json(
         url: String,
         action: String,
-        connectTimeoutMs: Int = 10_000,
-        readTimeoutMs: Int = 30_000,
+        connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = READ_TIMEOUT_MS,
     ): JSONObject {
         val body = text(url, action, connectTimeoutMs, readTimeoutMs)
         return try {
@@ -157,11 +169,37 @@ class WeatherClient {
         }
     }
 
+    /**
+     * 网络请求：连接 / 读超时都收紧到移动端可接受的范围，失败自动重试一次；
+     * HTTP 状态码错误（401 / 429 / 5xx 等）不重试，直接把中文原因交给仓库。
+     */
     private suspend fun text(
         url: String,
         action: String,
-        connectTimeoutMs: Int = 10_000,
-        readTimeoutMs: Int = 30_000,
+        connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = READ_TIMEOUT_MS,
+    ): String {
+        var lastError: IOException? = null
+        for (attempt in 0..REQUEST_RETRIES) {
+            try {
+                return requestTextOnce(url, action, connectTimeoutMs, readTimeoutMs)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HttpException) {
+                throw e
+            } catch (e: IOException) {
+                lastError = e
+                if (attempt < REQUEST_RETRIES) delay(RETRY_DELAY_MS)
+            }
+        }
+        throw lastError ?: IOException("$action：网络连接异常")
+    }
+
+    private suspend fun requestTextOnce(
+        url: String,
+        action: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
     ): String {
         val body = try {
             Http.getText(
@@ -183,7 +221,7 @@ class WeatherClient {
     }
 
     private fun networkReason(e: Exception): String = when (e) {
-        is SocketTimeoutException -> "天气服务响应慢，请稍后重试"
+        is SocketTimeoutException -> "天气服务响应慢，已自动重试，请稍后再试"
         is UnknownHostException -> "网络不可用，请检查连接"
         else -> e.message?.takeIf { it.isNotBlank() } ?: "网络连接异常"
     }
@@ -196,8 +234,8 @@ class WeatherClient {
                     "&current=pm2_5,us_aqi&timezone=auto",
                 headers = mapOf("Accept" to "application/json"),
                 // 空气质量是可选模块，超时短一点，别拖慢主天气
-                connectTimeoutMs = 5_000,
-                readTimeoutMs = 7_000,
+                connectTimeoutMs = 4_000,
+                readTimeoutMs = 6_000,
             )
         } catch (e: CancellationException) {
             throw e
@@ -339,5 +377,14 @@ class WeatherClient {
         const val UNKNOWN_CODE = -1
         const val MISSING_INT = Int.MIN_VALUE
         const val DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+        /** 移动网络下 6.5 秒连不上基本可以判定为弱网，不再死等。 */
+        const val CONNECT_TIMEOUT_MS = 6_500
+        const val READ_TIMEOUT_MS = 11_000
+        const val REQUEST_RETRIES = 1
+        const val RETRY_DELAY_MS = 350L
+
+        /** 主天气到手后，最多再等空气质量这么久，等不到就放弃这块可选数据。 */
+        const val AIR_WAIT_MS = 2_200L
     }
 }

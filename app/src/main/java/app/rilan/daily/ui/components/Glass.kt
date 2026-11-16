@@ -224,6 +224,11 @@ fun GlassCard(
     shape: RoundedCornerShape = RoundedCornerShape(30.dp),
     strong: Boolean = false,
     refraction: Boolean = false,
+    /**
+     * 翻页 / 横向滑动进行中时为 true：跳过最贵的「背景折射重绘」并收小阴影，
+     * 滑动结束立刻恢复，静止时的毛玻璃效果完全不变。
+     */
+    scrolling: Boolean = false,
     onClick: (() -> Unit)? = null,
     contentPadding: PaddingValues = PaddingValues(20.dp),
     sheen: Float = 0.34f,
@@ -254,14 +259,23 @@ fun GlassCard(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
             .shadow(
-                elevation = if (strong) 28.dp else 18.dp,
+                // 滑动中收小阴影：大圆角阴影每帧重算很贵，静止时恢复原来的厚度。
+                elevation = when {
+                    scrolling -> if (strong) 12.dp else 8.dp
+                    strong -> 28.dp
+                    else -> 18.dp
+                },
                 shape = shape,
                 clip = false,
                 ambientColor = Color.Black,
                 spotColor = Color(0xFF24345C),
             )
             .clip(shape)
-            .onGloballyPositioned { origin.value = it.positionInRoot() }
+            .onGloballyPositioned {
+                // 只在卡片真的换位置时写状态，避免滑动时每帧都触发一次快照提交。
+                val position = it.positionInRoot()
+                if (position != origin.value) origin.value = position
+            }
             .then(
                 if (onClick != null) {
                     Modifier.clickable(
@@ -275,7 +289,8 @@ fun GlassCard(
         // 1. 背景的折射：同一张壁纸、同一屏幕坐标，被裁进这张卡片。
         //    这里用 Canvas.drawImage 而不是整屏 Image 图层，位置只在绘制阶段读取，
         //    翻页时不会因为 onGloballyPositioned 触发整张卡片重组。
-        if (refraction && backdrop?.softBitmap != null) {
+        //    横向滑动时先跳过这块重绘（滑完立刻恢复），它是一帧里最贵的采样。
+        if (refraction && !scrolling && backdrop?.softBitmap != null) {
             val image = backdrop.softBitmap
             val screen = backdrop.size
             Canvas(Modifier.matchParentSize()) {

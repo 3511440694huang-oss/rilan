@@ -33,10 +33,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -71,6 +74,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -81,6 +85,7 @@ import app.rilan.daily.MainViewModel
 import app.rilan.daily.ui.components.AppBackdrop
 import app.rilan.daily.ui.components.GlassCard
 import app.rilan.daily.ui.extensions.ExtensionsScreen
+import app.rilan.daily.ui.extensions.ExtensionsSection
 import app.rilan.daily.ui.home.HomeScreen
 import app.rilan.daily.ui.review.ReviewScreen
 import app.rilan.daily.ui.schedule.ScheduleScreen
@@ -95,8 +100,17 @@ private enum class MainTab(val label: String, val icon: ImageVector) {
     EXTENSIONS("扩展", Icons.Filled.Build),
 }
 
-/** 非首页内容给悬浮导航让出的高度。 */
-private val DOCK_CONTENT_INSET = 92.dp
+/** 非首页内容给悬浮导航让出的基础高度：56dp 胶囊 + 8dp 间距 + 16dp 呼吸位。 */
+private val DOCK_CONTENT_BASE_INSET = 80.dp
+
+/**
+ * 悬浮导航让出的高度要叠加系统导航栏：手势导航约 24dp，三键导航约 48dp。
+ * 之前固定 92dp 在三键导航机型上会让最后一条内容压到胶囊下面。
+ */
+@Composable
+private fun dockContentInset(): Dp =
+    DOCK_CONTENT_BASE_INSET +
+        WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
 @Composable
 fun RilanRoot(vm: MainViewModel) {
@@ -105,6 +119,7 @@ fun RilanRoot(vm: MainViewModel) {
     val schedules by vm.schedules.collectAsStateWithLifecycle()
     val records by vm.records.collectAsStateWithLifecycle()
     val digests by vm.digests.collectAsStateWithLifecycle()
+    val summaryLoading by vm.summaryLoading.collectAsStateWithLifecycle()
     val settingsUi by vm.settingsUi.collectAsStateWithLifecycle()
     val mcpState by vm.mcpState.collectAsStateWithLifecycle()
     val mcpTest by vm.mcpTest.collectAsStateWithLifecycle()
@@ -114,9 +129,13 @@ fun RilanRoot(vm: MainViewModel) {
 
     var tabName by rememberSaveable { mutableStateOf(MainTab.HOME.name) }
     val tab = runCatching { MainTab.valueOf(tabName) }.getOrDefault(MainTab.HOME)
+    // 首页 / 设置页 / 回望页跳扩展页时，指定落点（来源 / 服务 / AI / 更多）。
+    var extensionsStart by rememberSaveable { mutableStateOf(ExtensionsSection.SOURCES) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
     var notificationsGranted by remember { mutableStateOf(vm.notificationsEnabled()) }
     var showLocationIntro by remember { mutableStateOf(false) }
+    // 内容底部留白跟随系统导航栏，悬浮胶囊不会压住最后一行。
+    val dockInset = dockContentInset()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -246,6 +265,7 @@ fun RilanRoot(vm: MainViewModel) {
                         }
                     },
                     onOpenExtensions = {
+                        extensionsStart = ExtensionsSection.AI
                         settingsOpen = false
                         tabName = MainTab.EXTENSIONS.name
                     },
@@ -289,7 +309,12 @@ fun RilanRoot(vm: MainViewModel) {
                                 onRefresh = vm::refreshAll,
                                 onOpenSettings = { settingsOpen = true },
                                 onItemClick = { item -> openUrl(context, item.url) },
-                                onOpenAiSettings = { settingsOpen = true },
+                                // 「去设置连接 DeepSeek」直接落在扩展页的 AI 分段，不用再自己找。
+                                onOpenAiSettings = {
+                                    extensionsStart = ExtensionsSection.AI
+                                    settingsOpen = false
+                                    tabName = MainTab.EXTENSIONS.name
+                                },
                                 onGenerateBrief = vm::generateDailyBrief,
                                 onRelocate = ::requestLocation,
                                 onOpenSchedule = { tabName = MainTab.SCHEDULE.name },
@@ -309,18 +334,28 @@ fun RilanRoot(vm: MainViewModel) {
                                 onRequestNotification = ::requestNotifications,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(bottom = DOCK_CONTENT_INSET),
+                                    .padding(bottom = dockInset),
                             )
                             MainTab.REVIEW -> ReviewScreen(
                                 records = records,
                                 digests = digests,
-                                loading = null,
+                                loading = summaryLoading,
                                 aiConfigured = mcpState.running,
-                                onGenerate = { tabName = MainTab.EXTENSIONS.name },
-                                onOpenSettings = { tabName = MainTab.EXTENSIONS.name },
+                                onGenerate = {
+                                    extensionsStart = ExtensionsSection.SERVICE
+                                    tabName = MainTab.EXTENSIONS.name
+                                },
+                                onOpenSettings = {
+                                    extensionsStart = ExtensionsSection.AI
+                                    tabName = MainTab.EXTENSIONS.name
+                                },
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(bottom = DOCK_CONTENT_INSET),
+                                    .padding(bottom = dockInset),
+                                deepseekConfigured = settingsUi.settings.deepseekConfigured,
+                                summaryMode = settingsUi.settings.summaryMode,
+                                onModeChange = vm::setSummaryMode,
+                                onGenerateDirect = vm::generatePeriodSummaryDirect,
                             )
                             MainTab.EXTENSIONS -> ExtensionsScreen(
                                 mcpState = mcpState,
@@ -346,9 +381,16 @@ fun RilanRoot(vm: MainViewModel) {
                                 onToggleHot = vm::setHotListEnabled,
                                 onReloadPlugins = vm::reloadPlugins,
                                 onRefreshContent = vm::refreshAll,
+                                settings = settingsUi.settings,
+                                aiTest = aiTest,
+                                onSaveSettings = vm::saveSettings,
+                                onTestDeepSeek = vm::testDeepSeek,
+                                initialSection = extensionsStart,
+                                notificationsGranted = notificationsGranted,
+                                onRequestNotifications = ::requestNotifications,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(bottom = DOCK_CONTENT_INSET),
+                                    .padding(bottom = dockInset),
                             )
                         }
                     }
@@ -420,14 +462,18 @@ private fun BottomDockScrim(modifier: Modifier = Modifier) {
     Box(
         modifier
             .fillMaxWidth()
-            .height(136.dp)
+            // 从 220dp 处就开始极缓慢地压暗，一路匀到导航下面：
+            // 没有明显起步线，透明卡片上不会再出现一条把卡片「切断」的横边。
+            .height(220.dp)
             .background(
                 Brush.verticalGradient(
-                    listOf(
-                        Color.Transparent,
-                        RilanColors.Ink.copy(alpha = 0.24f),
-                        RilanColors.Ink.copy(alpha = 0.70f),
-                    )
+                    0.00f to Color.Transparent,
+                    0.18f to RilanColors.Ink.copy(alpha = 0.03f),
+                    0.36f to RilanColors.Ink.copy(alpha = 0.08f),
+                    0.54f to RilanColors.Ink.copy(alpha = 0.16f),
+                    0.72f to RilanColors.Ink.copy(alpha = 0.29f),
+                    0.86f to RilanColors.Ink.copy(alpha = 0.45f),
+                    1.00f to RilanColors.Ink.copy(alpha = 0.64f),
                 )
             )
     )

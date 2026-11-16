@@ -46,6 +46,10 @@ private class SourceError(message: String) : Exception(message)
 /** 同时最多 8 个请求在飞，热搜 + 来源插件一起算；减少慢源拖住整轮刷新。 */
 private const val MAX_CONCURRENCY = 8
 
+/** 热搜接口只返回榜单，12 秒读不到就没必要再等；单个源慢不该拖住整轮内容刷新。 */
+private const val HOT_CONNECT_TIMEOUT_MS = 8_000
+private const val HOT_READ_TIMEOUT_MS = 12_000
+
 private const val WEIBO_URL = "https://weibo.com/ajax/side/hotSearch"
 private const val BILIBILI_URL = "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1"
 private const val DOUYIN_URL = "https://www.iesdouyin.com/web/api/v2/hotsearch/billboard/word/"
@@ -88,7 +92,7 @@ private val TITLE_NOISE = Regex("[\\p{P}\\p{S}\\s\\u3000]+")
  *
  * 设计要点：
  * - 每个源独立执行、独立兜底，单个源失败只会变成该板块的 error 文案；
- * - 并发上限 6（最多 6 个 async 工作者共同消费任务队列），避免同时打十几个连接；
+ * - 并发上限 8（最多 8 个 async 工作者共同消费任务队列），避免同时打十几个连接；
  * - 热搜不抓正文，只出榜单（后续 AI 分析只用标题）；
  * - 不打印任何响应内容，错误只保留一句中文描述。
  */
@@ -232,7 +236,12 @@ class ContentFetcher {
     // ── 微博热搜 ────────────────────────────────────────────────────────────
 
     private suspend fun loadWeibo(blockedWords: List<String>): Outcome = try {
-        val body = Http.getText(WEIBO_URL, headers = WEIBO_HEADERS)
+        val body = Http.getText(
+            WEIBO_URL,
+            headers = WEIBO_HEADERS,
+            connectTimeoutMs = HOT_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = HOT_READ_TIMEOUT_MS,
+        )
         val root = JSONObject(body)
         val realtime = root.optJSONObject("data")?.optJSONArray("realtime")
             ?: throw SourceError("热搜数据格式异常")
@@ -275,7 +284,12 @@ class ContentFetcher {
     // ── B站热门 ─────────────────────────────────────────────────────────────
 
     private suspend fun loadBilibili(blockedWords: List<String>): Outcome = try {
-        val body = Http.getText(BILIBILI_URL, headers = BILIBILI_HEADERS)
+        val body = Http.getText(
+            BILIBILI_URL,
+            headers = BILIBILI_HEADERS,
+            connectTimeoutMs = HOT_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = HOT_READ_TIMEOUT_MS,
+        )
         val root = JSONObject(body)
         val code = root.optInt("code", -1)
         if (code != 0) throw SourceError("B站接口返回 $code")
@@ -325,7 +339,12 @@ class ContentFetcher {
     // ── 抖音热搜 ────────────────────────────────────────────────────────────
 
     private suspend fun loadDouyin(blockedWords: List<String>): Outcome = try {
-        val body = Http.getText(DOUYIN_URL, headers = DOUYIN_HEADERS)
+        val body = Http.getText(
+            DOUYIN_URL,
+            headers = DOUYIN_HEADERS,
+            connectTimeoutMs = HOT_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = HOT_READ_TIMEOUT_MS,
+        )
         val root = JSONObject(body)
         val list = root.optJSONArray("word_list")
             ?: root.optJSONObject("data")?.optJSONArray("word_list")

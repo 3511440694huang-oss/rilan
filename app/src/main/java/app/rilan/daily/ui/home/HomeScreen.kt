@@ -7,7 +7,6 @@ package app.rilan.daily.ui.home
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.animateColorAsState
@@ -37,10 +36,13 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -48,6 +50,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -62,6 +65,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -78,6 +82,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.Category
@@ -113,8 +118,16 @@ private val PAGE_LABELS = listOf("天气", "简报", "信息", "今天")
 private val DAY_FORMAT = DateTimeFormatter.ofPattern("M月d日")
 private val WEEK_LABELS = listOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
-/** 悬浮底部导航会盖住卡片最下面一段，内容留出这么多呼吸空间。 */
-private val CARD_BOTTOM_INSET = 96.dp
+/**
+ * 悬浮底部导航（56dp 胶囊 + 8dp 间距）会盖住卡片最下面一段。
+ * 基础留白 80dp，再叠加系统导航栏高度，三键导航机型也不会把最后一条内容压在胶囊下面。
+ */
+private val CARD_BOTTOM_BASE_INSET = 80.dp
+
+@Composable
+private fun cardBottomInset(): Dp =
+    CARD_BOTTOM_BASE_INSET +
+        WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 日报：四张可以左右翻的玻璃卡片
@@ -142,7 +155,10 @@ fun HomeScreen(
     val total = remember(sections) { sections.sumOf { it.items.size } }
     val pager = rememberPagerState(pageCount = { PAGE_LABELS.size })
     val scope = rememberCoroutineScope()
-    val currentPage = pager.currentPage.coerceIn(0, PAGE_LABELS.lastIndex)
+    // 页面底部留白随系统导航栏高度变化，四页共用同一个值，内容不会被胶囊压住。
+    val bottomInset = cardBottomInset()
+    // 翻页手势进行中，只通知四张卡降级玻璃效果；布尔值只在起手 / 落定时变一次。
+    val scrolling by remember(pager) { derivedStateOf { pager.isScrollInProgress } }
     var entered by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { entered = true }
     val enter by animateFloatAsState(
@@ -204,6 +220,8 @@ fun HomeScreen(
                         onRefresh = onRefresh,
                         onRelocate = onRelocate,
                         sheen = 0.46f,
+                        scrolling = scrolling,
+                        bottomInset = bottomInset,
                         modifier = Modifier.fillMaxSize(),
                     )
 
@@ -214,6 +232,8 @@ fun HomeScreen(
                         onGenerateBrief = onGenerateBrief,
                         onOpenAiSettings = onOpenAiSettings,
                         sheen = 0.46f,
+                        scrolling = scrolling,
+                        bottomInset = bottomInset,
                     )
 
                     2 -> NewsPage(
@@ -226,18 +246,22 @@ fun HomeScreen(
                         onItemClick = onItemClick,
                         onRefresh = onRefresh,
                         sheen = 0.46f,
+                        scrolling = scrolling,
+                        bottomInset = bottomInset,
                     )
 
                     else -> TodayPage(
                         events = events,
                         onOpenSchedule = onOpenSchedule,
                         sheen = 0.46f,
+                        scrolling = scrolling,
+                        bottomInset = bottomInset,
                     )
                 }
             }
             }
             PageRail(
-                current = currentPage,
+                pager = pager,
                 onSelect = { index -> scope.launch { pager.animateScrollToPage(index) } },
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -381,10 +405,12 @@ private fun headerSubtitle(state: HomeState): String {
 /** 四段很细的页轨，替代原来占一整行的页码条。 */
 @Composable
 private fun PageRail(
-    current: Int,
+    pager: PagerState,
     onSelect: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // 页轨自己订阅页码：翻页时只重组这一小段，不会牵动四张卡片。
+    val current by remember(pager) { derivedStateOf { pager.currentPage } }
     Row(
         modifier
             .clip(CircleShape)
@@ -437,6 +463,8 @@ private fun BriefingPage(
     onGenerateBrief: () -> Unit,
     onOpenAiSettings: () -> Unit,
     sheen: Float,
+    scrolling: Boolean,
+    bottomInset: Dp,
 ) {
     val brief = state.dailyBrief
     val insight = state.weatherInsight
@@ -450,6 +478,7 @@ private fun BriefingPage(
         shape = RoundedCornerShape(32.dp),
         strong = true,
         refraction = true,
+        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
@@ -457,8 +486,7 @@ private fun BriefingPage(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = CARD_BOTTOM_INSET)
-                .animateContentSize(spring(stiffness = 380f, dampingRatio = 0.86f)),
+                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = bottomInset),
             verticalArrangement = Arrangement.spacedBy(15.dp),
         ) {
             PageHeading(
@@ -722,6 +750,8 @@ private fun NewsPage(
     onItemClick: (NewsItem) -> Unit,
     onRefresh: () -> Unit,
     sheen: Float,
+    scrolling: Boolean,
+    bottomInset: Dp,
 ) {
     val active = sections.firstOrNull { it.category == selected }
     var categoriesExpanded by rememberSaveable { mutableStateOf(false) }
@@ -729,7 +759,10 @@ private fun NewsPage(
     GlassCard(
         modifier = Modifier.fillMaxSize(),
         shape = RoundedCornerShape(32.dp),
+        // 四张卡统一用同一种玻璃厚度，底部渐隐下四页看起来一致。
+        strong = true,
         refraction = true,
+        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
@@ -800,7 +833,7 @@ private fun NewsPage(
 
                 LazyColumn(
                     Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = CARD_BOTTOM_INSET),
+                    contentPadding = PaddingValues(bottom = bottomInset),
                 ) {
                     if (!error.isNullOrBlank()) {
                         item {
@@ -826,7 +859,8 @@ private fun NewsPage(
                     } else {
                         itemsIndexed(
                             items = items,
-                            key = { index, item -> "${item.id}-$index" },
+                            // 稳定 key：id + 分类（id 在不同板块可能重复，分类把它区分开）。
+                            key = { _, item -> "${item.id}-${item.category.name}" },
                         ) { index, item ->
                             NewsRow(
                                 index = index,
@@ -1098,6 +1132,8 @@ private fun TodayPage(
     events: List<ScheduleEvent>,
     onOpenSchedule: () -> Unit,
     sheen: Float,
+    scrolling: Boolean,
+    bottomInset: Dp,
 ) {
     val today = remember { LocalDate.now() }
     val todayEvents = remember(events, today) {
@@ -1123,7 +1159,9 @@ private fun TodayPage(
     GlassCard(
         modifier = Modifier.fillMaxSize(),
         shape = RoundedCornerShape(32.dp),
+        strong = true,
         refraction = true,
+        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
@@ -1131,7 +1169,7 @@ private fun TodayPage(
             Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = CARD_BOTTOM_INSET),
+                .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = bottomInset),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             PageHeading(

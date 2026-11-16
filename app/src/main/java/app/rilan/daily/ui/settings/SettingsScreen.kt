@@ -50,14 +50,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.rilan.daily.BuildConfig
 import app.rilan.daily.core.AiTestState
 import app.rilan.daily.core.AppSettings
-import app.rilan.daily.core.DEEPSEEK_MODEL_IDS
 import app.rilan.daily.core.CityResult
 import app.rilan.daily.core.Priority
 import app.rilan.daily.core.SettingsUiState
@@ -90,9 +87,6 @@ fun SettingsScreen(
     var cityQuery by remember { mutableStateOf("") }
     var confirmClearAi by remember { mutableStateOf(false) }
     val settings = state.settings
-    var keyDraft by remember(settings.deepseekApiKey) { mutableStateOf(settings.deepseekApiKey) }
-    var modelDraft by remember(settings.deepseekModel) { mutableStateOf(settings.deepseekModel) }
-    var showKey by remember { mutableStateOf(false) }
 
     fun saved() {
         Toast.makeText(context, "已保存", Toast.LENGTH_SHORT).show()
@@ -250,119 +244,6 @@ fun SettingsScreen(
             }
         }
 
-        // ── DeepSeek ─────────────────────────────────────────────────────────
-        item {
-            GlassCard(Modifier.fillMaxWidth(), strong = true) {
-                Column(verticalArrangement = Arrangement.spacedBy(11.dp)) {
-                    SectionLabel("DeepSeek 总结", RilanColors.Dawn, Modifier.fillMaxWidth()) {
-                        GlassPill(
-                            text = if (settings.deepseekConfigured) "已连接" else "未连接",
-                            color = if (settings.deepseekConfigured) RilanColors.Dawn else RilanColors.TextTertiary,
-                            background = (if (settings.deepseekConfigured) RilanColors.Dawn else Color.White)
-                                .copy(alpha = 0.09f),
-                        )
-                    }
-                    Text(
-                        "填入 DeepSeek API Key，首页就能直接总结今天的天气、信息流和日程，并给出建议。生成时这些内容会发给 DeepSeek；Key 只保存在本机。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = RilanColors.TextSecondary,
-                    )
-                    OutlinedTextField(
-                        value = keyDraft,
-                        onValueChange = { keyDraft = it },
-                        placeholder = { Text("sk-…") },
-                        singleLine = true,
-                        visualTransformation = if (showKey) androidx.compose.ui.text.input.VisualTransformation.None
-                            else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password,
-                            imeAction = ImeAction.Done,
-                        ),
-                        trailingIcon = {
-                            Text(
-                                if (showKey) "隐藏" else "显示",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = RilanColors.Dawn,
-                                modifier = Modifier
-                                    .clickable { showKey = !showKey }
-                                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(15.dp),
-                        colors = fieldColors(),
-                    )
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        DEEPSEEK_MODEL_IDS.forEach { model ->
-                            DeepSeekModelChip(
-                                model = model,
-                                selected = modelDraft == model,
-                                onClick = { modelDraft = model },
-                                modifier = Modifier.weight(1f),
-                            )
-                        }
-                    }
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        SecondaryButton(
-                            text = if (keyDraft.isBlank() && settings.deepseekConfigured) "清除配置" else "保存配置",
-                            onClick = {
-                                onSave(
-                                    settings.copy(
-                                        deepseekApiKey = keyDraft.trim(),
-                                        deepseekModel = modelDraft,
-                                    )
-                                )
-                                saved()
-                            },
-                            modifier = Modifier.weight(1f),
-                        )
-                        SecondaryButton(
-                            text = if (aiTest.loading) "连接中…" else "测试连接",
-                            onClick = { onTestDeepSeek(keyDraft.trim(), modelDraft) },
-                            enabled = keyDraft.isNotBlank() && !aiTest.loading,
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                    when {
-                        aiTest.loading -> LoadingDots(RilanColors.Dawn)
-                        aiTest.message != null -> Text(
-                            aiTest.message,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (aiTest.ok) RilanColors.Jade else RilanColors.Danger,
-                        )
-                    }
-                    Text(
-                        "模型：deepseek-flash 更快；deepseek-v4-pro 更细。生成一次大约几千 token，按 DeepSeek 官方价格计费。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = RilanColors.TextTertiary,
-                    )
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(15.dp))
-                            .background(RilanColors.Moon.copy(alpha = 0.06f))
-                            .border(0.75.dp, RilanColors.Moon.copy(alpha = 0.16f), RoundedCornerShape(15.dp))
-                            .clickable(onClick = onOpenExtensions)
-                            .padding(13.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text("还想让外部 AI 读写？", style = MaterialTheme.typography.titleSmall, color = RilanColors.Text)
-                            Text("MCP 用于外部 AI，不是直连总结的必需品", style = MaterialTheme.typography.labelSmall, color = RilanColors.TextTertiary)
-                        }
-                        Text("→", color = RilanColors.Moon)
-                    }
-                }
-            }
-        }
-
         // ── 提醒 ─────────────────────────────────────────────────────────────
         item {
             GlassCard(Modifier.fillMaxWidth()) {
@@ -417,7 +298,7 @@ fun SettingsScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     SectionLabel("AI / MCP", RilanColors.Gold)
                     Text(
-                        "DeepSeek 负责首页的今日总览；MCP 让外部 AI 读取日报、写入解读、操作日程和来源。两条路可以单独使用。",
+                        "DeepSeek 负责首页的今日总览；MCP 让外部 AI 读取日报、写入解读、操作日程和来源。两条路可以单独使用，API Key 与 MCP 配置都在扩展页管理。",
                         style = MaterialTheme.typography.bodySmall,
                         color = RilanColors.TextSecondary,
                     )
@@ -441,7 +322,7 @@ fun SettingsScreen(
                         Column(Modifier.weight(1f)) {
                             Text("打开扩展页", style = MaterialTheme.typography.titleSmall, color = RilanColors.Text)
                             Text(
-                                "启动 MCP、复制配置、管理来源",
+                                "启动 MCP、管理来源与 DeepSeek Key",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = RilanColors.TextTertiary,
                             )
@@ -511,49 +392,6 @@ private fun PriorityHelp() {
                 color = RilanColors.TextTertiary,
             )
         }
-    }
-}
-
-@Composable
-private fun DeepSeekModelChip(
-    model: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val label = when (model) {
-        "deepseek-v4-pro" -> "deepseek-v4-pro"
-        else -> "deepseek-flash"
-    }
-    val hint = if (model == "deepseek-v4-pro") "更细" else "更快"
-    Row(
-        modifier
-            .clip(RoundedCornerShape(13.dp))
-            .background(if (selected) RilanColors.Dawn.copy(alpha = 0.13f) else Color.White.copy(alpha = 0.045f))
-            .border(
-                0.75.dp,
-                if (selected) RilanColors.Dawn.copy(alpha = 0.45f) else Color.White.copy(alpha = 0.11f),
-                RoundedCornerShape(13.dp),
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 11.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Box(
-            Modifier
-                .size(5.dp)
-                .clip(CircleShape)
-                .background(if (selected) RilanColors.Dawn else RilanColors.TextTertiary.copy(alpha = 0.5f))
-        )
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
-            color = if (selected) RilanColors.Text else RilanColors.TextSecondary,
-            maxLines = 1,
-            modifier = Modifier.weight(1f),
-        )
-        Text(hint, style = MaterialTheme.typography.labelSmall, color = if (selected) RilanColors.Dawn else RilanColors.TextTertiary)
     }
 }
 

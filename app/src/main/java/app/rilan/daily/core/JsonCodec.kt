@@ -16,6 +16,9 @@ object JsonCodec {
         put("longitude", s.longitude)
         put("timezone", s.timezone)
         put("reminderMinuteOfDay", s.reminderMinuteOfDay)
+        put("dailyNoticeEnabled", s.dailyNoticeEnabled)
+        put("dailyNoticeMinuteOfDay", s.dailyNoticeMinuteOfDay)
+        put("autoStartEnabled", s.autoStartEnabled)
         put("blockedWords", JSONArray(s.blockedWords))
         put("lastWeatherAt", s.lastWeatherAt)
         put("lastContentAt", s.lastContentAt)
@@ -31,6 +34,7 @@ object JsonCodec {
         put("mcpToken", s.mcpToken)
         put("deepseekApiKey", s.deepseekApiKey)
         put("deepseekModel", s.deepseekModel)
+        put("summaryMode", s.summaryMode.name)
         put("feeds", JSONArray().apply {
             s.feeds.forEach { put(encodeFeed(it)) }
         })
@@ -57,6 +61,11 @@ object JsonCodec {
                 longitude = o.optDouble("longitude", 116.4074),
                 timezone = o.optString("timezone", "Asia/Shanghai"),
                 reminderMinuteOfDay = o.optInt("reminderMinuteOfDay", 8 * 60 + 30),
+                // 旧版本没有这三个字段：默认关闭每日简报、08:00、不自启动。
+                dailyNoticeEnabled = o.optBoolean("dailyNoticeEnabled", false),
+                dailyNoticeMinuteOfDay = o.optInt("dailyNoticeMinuteOfDay", 8 * 60)
+                    .coerceIn(0, 24 * 60 - 1),
+                autoStartEnabled = o.optBoolean("autoStartEnabled", false),
                 feeds = feeds.ifEmpty { FeedSource.DEFAULTS },
                 blockedWords = words,
                 lastWeatherAt = o.optLong("lastWeatherAt", 0L),
@@ -74,6 +83,8 @@ object JsonCodec {
                 deepseekApiKey = o.optString("deepseekApiKey"),
                 deepseekModel = o.optString("deepseekModel", "deepseek-flash")
                     .takeIf { it in DEEPSEEK_MODEL_IDS } ?: "deepseek-flash",
+                // 旧版本没有这个字段，落到默认的 MCP 写回。
+                summaryMode = SummaryMode.parse(o.optString("summaryMode")),
             )
         }.getOrElse { AppSettings() }
     }
@@ -391,6 +402,8 @@ object JsonCodec {
             put(JSONObject().apply {
                 put("period", d.period.name); put("key", d.key); put("range", d.rangeText)
                 put("content", d.content); put("count", d.itemCount); put("createdAt", d.createdAt)
+                put("source", d.source)
+                put("error", d.error ?: JSONObject.NULL)
             })
         }
     }.toString()
@@ -410,6 +423,11 @@ object JsonCodec {
                     content = o.optString("content"),
                     itemCount = o.optInt("count"),
                     createdAt = o.optLong("createdAt"),
+                    error = o.optString("error").takeIf { it.isNotBlank() && it != "null" },
+                    // 旧数据没有 source 字段，按 MCP 写回处理。
+                    source = o.optString("source")
+                        .takeIf { it.isNotBlank() }
+                        ?: AiDigest.SOURCE_MCP,
                 )
             }
             map
