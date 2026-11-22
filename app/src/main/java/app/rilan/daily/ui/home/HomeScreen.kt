@@ -52,7 +52,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -133,6 +133,9 @@ private fun cardBottomInset(): Dp =
 // 日报：四张可以左右翻的玻璃卡片
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** 入场动画是否已经播过：放在进程级，切 tab 回来不再重播。 */
+private var homeIntroPlayed = false
+
 @Composable
 fun HomeScreen(
     state: HomeState,
@@ -145,6 +148,7 @@ fun HomeScreen(
     onGenerateBrief: () -> Unit,
     onRelocate: () -> Unit,
     onOpenSchedule: () -> Unit,
+    onOpenFeed: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val sections = remember(state.sections) {
@@ -155,12 +159,21 @@ fun HomeScreen(
     val total = remember(sections) { sections.sumOf { it.items.size } }
     val pager = rememberPagerState(pageCount = { PAGE_LABELS.size })
     val scope = rememberCoroutineScope()
+    // 落到「信息流」页时先刷一次，比等下一个 2 分钟周期更快。
+    LaunchedEffect(pager.settledPage) {
+        if (pager.settledPage == 2) onOpenFeed()
+    }
     // 页面底部留白随系统导航栏高度变化，四页共用同一个值，内容不会被胶囊压住。
     val bottomInset = cardBottomInset()
-    // 翻页手势进行中，只通知四张卡降级玻璃效果；布尔值只在起手 / 落定时变一次。
-    val scrolling by remember(pager) { derivedStateOf { pager.isScrollInProgress } }
-    var entered by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { entered = true }
+    // 入场动画每个进程只播一次：切 tab 时 HomeScreen 会被销毁重建，
+    // 每次回来都让整屏（Pager + 四张玻璃卡）在 560ms 里逐帧半透明合成，刚切回来那一下就会卡。
+    var entered by remember { mutableStateOf(homeIntroPlayed) }
+    LaunchedEffect(Unit) {
+        if (!homeIntroPlayed) {
+            homeIntroPlayed = true
+            entered = true
+        }
+    }
     val enter by animateFloatAsState(
         targetValue = if (entered) 1f else 0f,
         animationSpec = tween(560, easing = FastOutSlowInEasing),
@@ -198,9 +211,11 @@ fun HomeScreen(
                     .fillMaxSize()
                     .graphicsLayer {
                         // 只在绘制层读取 pager 偏移，避免翻页时四张卡整页重组。
-                        val distance = runCatching {
-                            pager.getOffsetFractionForPage(page).absoluteValue
-                        }.getOrDefault(0f).coerceIn(0f, 1f)
+                        // 用公开状态直接算，不再靠 getOffsetFractionForPage + 异常兜底：
+                        // 那个 API 在页码与快照不同步时会抛异常，每帧构造一次异常很卡。
+                        val distance = (
+                            (pager.currentPage - page) + pager.currentPageOffsetFraction
+                            ).absoluteValue.coerceIn(0f, 1f)
                         val scale = 1f - 0.042f * distance
                         scaleX = scale
                         scaleY = scale
@@ -220,7 +235,6 @@ fun HomeScreen(
                         onRefresh = onRefresh,
                         onRelocate = onRelocate,
                         sheen = 0.46f,
-                        scrolling = scrolling,
                         bottomInset = bottomInset,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -232,7 +246,6 @@ fun HomeScreen(
                         onGenerateBrief = onGenerateBrief,
                         onOpenAiSettings = onOpenAiSettings,
                         sheen = 0.46f,
-                        scrolling = scrolling,
                         bottomInset = bottomInset,
                     )
 
@@ -246,7 +259,6 @@ fun HomeScreen(
                         onItemClick = onItemClick,
                         onRefresh = onRefresh,
                         sheen = 0.46f,
-                        scrolling = scrolling,
                         bottomInset = bottomInset,
                     )
 
@@ -254,7 +266,6 @@ fun HomeScreen(
                         events = events,
                         onOpenSchedule = onOpenSchedule,
                         sheen = 0.46f,
-                        scrolling = scrolling,
                         bottomInset = bottomInset,
                     )
                 }
@@ -346,9 +357,10 @@ private fun HomeHeader(
 
 @Composable
 private fun SpinIconButton(spinning: Boolean, onClick: () -> Unit) {
+    // 旋转动画只在图层里读值：刷新时这枚图标每帧只更新一个 rotationZ，
+    // 不会把整条顶栏（和下面的卡片）带着重组。
     val angle = if (spinning) {
-        val transition = rememberInfiniteTransition(label = "refreshSpin")
-        val value by transition.animateFloat(
+        rememberInfiniteTransition(label = "refreshSpin").animateFloat(
             initialValue = 0f,
             targetValue = 360f,
             animationSpec = infiniteRepeatable(
@@ -357,9 +369,8 @@ private fun SpinIconButton(spinning: Boolean, onClick: () -> Unit) {
             ),
             label = "refreshAngle",
         )
-        value
     } else {
-        0f
+        null
     }
     Box(
         Modifier
@@ -387,7 +398,7 @@ private fun SpinIconButton(spinning: Boolean, onClick: () -> Unit) {
             tint = if (spinning) RilanColors.Moon else RilanColors.Text,
             modifier = Modifier
                 .size(18.dp)
-                .graphicsLayer { rotationZ = if (spinning) angle else 0f },
+                .graphicsLayer { rotationZ = angle?.value ?: 0f },
         )
     }
 }
@@ -463,7 +474,6 @@ private fun BriefingPage(
     onGenerateBrief: () -> Unit,
     onOpenAiSettings: () -> Unit,
     sheen: Float,
-    scrolling: Boolean,
     bottomInset: Dp,
 ) {
     val brief = state.dailyBrief
@@ -477,15 +487,13 @@ private fun BriefingPage(
         modifier = Modifier.fillMaxSize(),
         shape = RoundedCornerShape(32.dp),
         strong = true,
-        refraction = true,
-        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
         Column(
             Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) })
                 .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = bottomInset),
             verticalArrangement = Arrangement.spacedBy(15.dp),
         ) {
@@ -750,7 +758,6 @@ private fun NewsPage(
     onItemClick: (NewsItem) -> Unit,
     onRefresh: () -> Unit,
     sheen: Float,
-    scrolling: Boolean,
     bottomInset: Dp,
 ) {
     val active = sections.firstOrNull { it.category == selected }
@@ -761,8 +768,6 @@ private fun NewsPage(
         shape = RoundedCornerShape(32.dp),
         // 四张卡统一用同一种玻璃厚度，底部渐隐下四页看起来一致。
         strong = true,
-        refraction = true,
-        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
@@ -824,9 +829,11 @@ private fun NewsPage(
                 label = "homeFeed",
             ) { category ->
                 val section = sections.firstOrNull { it.category == category }
+                // 不再截断：信息流一直向下滑，所有抓到的条目都能看到。
+                // 分类页显示该分类全部条目；「全部」把各板块按轮转顺序铺开。
                 val items = remember(section, sections, category) {
-                    if (section == null) interleave(sections).take(28)
-                    else section.items.take(18)
+                    if (section == null) distinctById(interleave(sections))
+                    else distinctById(section.items)
                 }
                 val accent = section?.category?.let { Color(it.accent) } ?: RilanColors.Moon
                 val error = section?.error
@@ -881,7 +888,8 @@ private fun NewsPage(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    "点标题打开原文",
+                                    if (category == null) "已经到底了 · 共 ${items.size} 条"
+                                    else "这个分类已全部显示 · ${items.size} 条",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = RilanColors.TextTertiary,
                                     modifier = Modifier.weight(1f),
@@ -1132,7 +1140,6 @@ private fun TodayPage(
     events: List<ScheduleEvent>,
     onOpenSchedule: () -> Unit,
     sheen: Float,
-    scrolling: Boolean,
     bottomInset: Dp,
 ) {
     val today = remember { LocalDate.now() }
@@ -1160,15 +1167,13 @@ private fun TodayPage(
         modifier = Modifier.fillMaxSize(),
         shape = RoundedCornerShape(32.dp),
         strong = true,
-        refraction = true,
-        scrolling = scrolling,
         contentPadding = PaddingValues(0.dp),
         sheen = sheen,
     ) {
         Column(
             Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) })
                 .padding(start = 20.dp, end = 20.dp, top = 38.dp, bottom = bottomInset),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -1458,6 +1463,13 @@ internal fun updatedText(epochMillis: Long): String =
 
 private fun weekdayLabel(date: LocalDate): String =
     WEEK_LABELS[(date.dayOfWeek.value - 1).coerceIn(0, 6)]
+
+/** 同一板块里 id+分类 只保留一条：LazyColumn 的 key 重复会直接崩掉整个界面。 */
+private fun distinctById(items: List<NewsItem>): List<NewsItem> {
+    if (items.size < 2) return items
+    val seen = HashSet<String>(items.size * 2)
+    return items.filter { seen.add("${it.id}-${it.category.name}") }
+}
 
 private fun interleave(sections: List<NewsSection>): List<NewsItem> {
     val lists = sections.map { it.items }

@@ -61,7 +61,14 @@ class PluginFetcher {
     // ── RSS / Atom ──────────────────────────────────────────────────────────
 
     private suspend fun fetchRss(plugin: SourcePlugin): PluginFetchResult {
-        val xml = Http.getText(plugin.url, plugin.headers)
+        // RSS 支持 ETag / Last-Modified：命中 304 时复用上次正文，不重复下载整份 XML。
+        val xml = Http.getTextCached(
+            url = plugin.url,
+            headers = plugin.headers,
+            cacheKey = "plugin:${plugin.id}|${plugin.url}",
+            connectTimeoutMs = 6_000,
+            readTimeoutMs = 10_000,
+        )
         // 不必把插件 id 写死进 RssParser：按 url 识别的源也能走对分支。
         val source = FeedSource(plugin.id, plugin.name, plugin.url, plugin.category)
         val items = RssParser.parse(xml, source)
@@ -75,7 +82,12 @@ class PluginFetcher {
         plugin: SourcePlugin,
         blockedWords: List<String>,
     ): PluginFetchResult {
-        val body = Http.getText(plugin.url, plugin.headers)
+        val body = Http.getText(
+            plugin.url,
+            plugin.headers,
+            connectTimeoutMs = 6_000,
+            readTimeoutMs = 9_000,
+        )
         val root = parseRoot(body)
         val array = resolveArray(root, plugin.mapping.items)
             ?: throw PluginError(

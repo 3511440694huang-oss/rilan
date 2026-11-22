@@ -13,7 +13,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -209,13 +208,13 @@ fun RilanRoot(vm: MainViewModel) {
 
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // 应用一直开着时，天气最多 5 分钟、信息流最多 8 分钟就会刷新一次；
-    // 跨天也会顺带换壁纸和清掉昨天的 AI 总览。只在 RESUMED 时发请求。
+    // 前台每 20 秒敲一次心跳：天气走 45 秒一次的轻量实时轮询、每 10 分钟补全量预报，
+    // 信息流每 2 分钟刷新。只在 RESUMED 时发请求，后台不耗电。
     LaunchedEffect(lifecycleOwner) {
         while (true) {
-            delay(3 * 60_000L)
+            delay(20_000L)
             if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                vm.onForeground()
+                vm.onTick()
             }
         }
     }
@@ -318,6 +317,7 @@ fun RilanRoot(vm: MainViewModel) {
                                 onGenerateBrief = vm::generateDailyBrief,
                                 onRelocate = ::requestLocation,
                                 onOpenSchedule = { tabName = MainTab.SCHEDULE.name },
+                                onOpenFeed = vm::onFeedOpened,
                                 modifier = Modifier.fillMaxSize(),
                             )
                             MainTab.SCHEDULE -> ScheduleScreen(
@@ -494,11 +494,11 @@ private fun RilanNavBar(
     ) {
         GlassCard(
             modifier = Modifier
-                .height(56.dp)
-                .animateContentSize(spring(stiffness = 380f, dampingRatio = 0.88f)),
+                // 高度固定 56dp，不需要 animateContentSize：它只会让每次切 tab
+                // 都多跑一轮尺寸动画，白白重排一遍底部导航。
+                .height(56.dp),
             shape = RoundedCornerShape(28.dp),
             strong = false,
-            refraction = true,
             sheen = 0.40f,
             contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
         ) {

@@ -11,7 +11,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +43,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -55,6 +57,7 @@ import app.rilan.daily.ui.components.GlassIconButton
 import app.rilan.daily.ui.theme.RilanColors
 import java.time.LocalDate
 import java.time.YearMonth
+import kotlin.math.abs
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 月历卡：周一开头的 6×7 网格。
@@ -153,21 +156,44 @@ private fun SwipeableMonthGrid(
         Modifier
             .fillMaxWidth()
             .pointerInput(Unit) {
-                var dragged = 0f
-                detectHorizontalDragGestures(
-                    onDragStart = { dragged = 0f },
-                    onDragCancel = { dragged = 0f },
-                    onDragEnd = {
-                        if (dragged <= -72f) {
+                // 只在「横向占优」时接管这一串手势：拇指斜着上下滑的时候，
+                // 竖直位移必须完整留给外层 LazyColumn，否则月历这块最占面积的触摸区
+                // 会把整页的竖滑吃掉，表现就是滑不动。
+                // 阈值也用 dp，别写裸像素——同一条手势在 3x 屏上不该只走 24dp 就翻月。
+                val slop = viewConfiguration.touchSlop
+                val monthStep = 72.dp.toPx()
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var totalX = 0f
+                    var totalY = 0f
+                    var claimed = false
+                    var released = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        totalX += change.positionChange().x
+                        totalY += change.positionChange().y
+                        if (!claimed) {
+                            if (abs(totalX) > slop && abs(totalX) > abs(totalY)) {
+                                claimed = true
+                            } else if (abs(totalY) > slop) {
+                                // 竖直手势：不消费、直接放弃，让外层列表继续滚
+                                break
+                            }
+                        }
+                        if (claimed) change.consume()
+                        if (!change.pressed) {
+                            released = true
+                            break
+                        }
+                    }
+                    if (claimed && released) {
+                        if (totalX <= -monthStep) {
                             changeMonth(currentMonth.plusMonths(1))
-                        } else if (dragged >= 72f) {
+                        } else if (totalX >= monthStep) {
                             changeMonth(currentMonth.minusMonths(1))
                         }
-                        dragged = 0f
-                    },
-                ) { change, dragAmount ->
-                    dragged += dragAmount
-                    change.consume()
+                    }
                 }
             },
     ) {

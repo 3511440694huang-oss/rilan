@@ -11,7 +11,6 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,9 +37,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,13 +46,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageShader
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.Shadow
@@ -64,8 +61,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -74,8 +70,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.AiText
@@ -83,20 +77,11 @@ import app.rilan.daily.core.WallpaperInfo
 import app.rilan.daily.ui.theme.RilanColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlin.math.roundToInt
 import kotlin.random.Random
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 背景：深靛蓝的夜、月光与地平线的杏桃。壁纸退到远处，只负责给玻璃提供折射。
 // ─────────────────────────────────────────────────────────────────────────────
-
-data class GlassBackdrop(
-    val photo: ImageBitmap?,
-    val softBitmap: ImageBitmap?,
-    val size: IntSize,
-)
-
-val LocalGlassBackdrop = compositionLocalOf<GlassBackdrop?> { null }
 
 @Composable
 fun AppBackdrop(
@@ -105,34 +90,31 @@ fun AppBackdrop(
     content: @Composable BoxScope.() -> Unit,
 ) {
     var photo by remember { mutableStateOf<ImageBitmap?>(null) }
-    var softBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
-    var backdropSize by remember { mutableStateOf(IntSize.Zero) }
+    // 按屏幕长边解码：必应原图动辄 4K，全量解码既占内存又让首帧更慢。
+    val metrics = LocalContext.current.resources.displayMetrics
+    val targetEdge = maxOf(metrics.widthPixels, metrics.heightPixels)
 
-    LaunchedEffect(wallpaper?.path) {
+    LaunchedEffect(wallpaper?.path, targetEdge) {
         val path = wallpaper?.path
         if (path == null) {
             photo = null
-            softBitmap = null
             return@LaunchedEffect
         }
-        val loaded = withContext(Dispatchers.IO) {
-            runCatching { photoBitmap(path) to frostedBitmap(path) }.getOrNull()
-        } ?: return@LaunchedEffect
-        photo = loaded.first
-        softBitmap = loaded.second
+        photo = withContext(Dispatchers.IO) {
+            runCatching { photoBitmap(path, targetEdge) }.getOrNull()
+        }
     }
 
     Box(
         modifier
             .fillMaxSize()
-            .onGloballyPositioned { backdropSize = it.size }
             .background(RilanColors.Ink)
     ) {
-        // 每天一张必应壁纸，铺满整屏。卡片的折射与这里的照片共用同一张图，
-        // 所以玻璃里的颜色和背景是同一个世界，而不是一张独立的渐变。
+        // 每天一张必应壁纸，铺满整屏；卡片是它上面的一张半透明玻璃。
         Crossfade(
             targetState = photo,
-            animationSpec = tween(1100),
+            // 两张全屏位图同时合成是最重的一帧，1.1 秒实在太久，收到 600ms 仍然够柔和。
+            animationSpec = tween(600),
             label = "dailyWallpaper",
         ) { bmp ->
             if (bmp != null) {
@@ -166,25 +148,25 @@ fun AppBackdrop(
             }
         }
 
-        Canvas(Modifier.fillMaxSize()) {
-            // 四角压暗，照片才不会在边缘抢走卡片的注意力。
-            drawRect(
-                brush = Brush.horizontalGradient(
-                    listOf(Color(0x5C070912), Color.Transparent, Color.Transparent, Color(0x4D070912))
-                )
-            )
-            drawRect(brush = GrainBrush, alpha = 0.22f)
-        }
+        // 背景是整屏最大的一块静态绘制：画刷缓存一次 + 独立图层，
+        // 列表滚动时它只被合成，不会跟着每帧重录。
+        Spacer(
+            Modifier
+                .fillMaxSize()
+                .graphicsLayer()
+                .drawWithCache {
+                    // 四角压暗，照片才不会在边缘抢走卡片的注意力。
+                    val corners = Brush.horizontalGradient(
+                        listOf(Color(0x5C070912), Color.Transparent, Color.Transparent, Color(0x4D070912))
+                    )
+                    onDrawBehind {
+                        drawRect(corners)
+                        drawRect(GrainBrush, alpha = 0.22f)
+                    }
+                }
+        )
 
-        CompositionLocalProvider(
-            LocalGlassBackdrop provides GlassBackdrop(
-                photo = photo,
-                softBitmap = softBitmap,
-                size = backdropSize,
-            )
-        ) {
-            content()
-        }
+        content()
     }
 }
 
@@ -198,20 +180,25 @@ private val BackdropScrim = Brush.verticalGradient(
 
 @Composable
 private fun FallbackBackdrop() {
-    Canvas(Modifier.fillMaxSize()) {
-        drawRect(RilanColors.Ink)
-        val center = Offset(size.width * 0.18f, size.height * 0.08f)
-        drawCircle(
-            brush = Brush.radialGradient(
-                listOf(RilanColors.Moon.copy(alpha = 0.08f), Color.Transparent),
-                center = center,
-                radius = size.width * 0.9f,
-            ),
-            radius = size.width * 0.9f,
-            center = center,
-        )
-        drawRect(brush = GrainBrush, alpha = 0.26f)
-    }
+    Spacer(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer()
+            .drawWithCache {
+                val center = Offset(size.width * 0.18f, size.height * 0.08f)
+                val radius = size.width * 0.9f
+                val glow = Brush.radialGradient(
+                    listOf(RilanColors.Moon.copy(alpha = 0.08f), Color.Transparent),
+                    center = center,
+                    radius = radius,
+                )
+                onDrawBehind {
+                    drawRect(RilanColors.Ink)
+                    drawCircle(glow, radius = radius, center = center)
+                    drawRect(GrainBrush, alpha = 0.26f)
+                }
+            }
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,12 +210,6 @@ fun GlassCard(
     modifier: Modifier = Modifier,
     shape: RoundedCornerShape = RoundedCornerShape(30.dp),
     strong: Boolean = false,
-    refraction: Boolean = false,
-    /**
-     * 翻页 / 横向滑动进行中时为 true：跳过最贵的「背景折射重绘」并收小阴影，
-     * 滑动结束立刻恢复，静止时的毛玻璃效果完全不变。
-     */
-    scrolling: Boolean = false,
     onClick: (() -> Unit)? = null,
     contentPadding: PaddingValues = PaddingValues(20.dp),
     sheen: Float = 0.34f,
@@ -241,8 +222,6 @@ fun GlassCard(
         animationSpec = spring(stiffness = 520f, dampingRatio = 0.78f),
         label = "glassPress",
     )
-    val backdrop = LocalGlassBackdrop.current
-    val origin = remember { mutableStateOf(Offset.Zero) }
 
     val topFill = if (strong) {
         RilanColors.SurfaceRaised.copy(alpha = 0.54f)
@@ -259,23 +238,14 @@ fun GlassCard(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
             .shadow(
-                // 滑动中收小阴影：大圆角阴影每帧重算很贵，静止时恢复原来的厚度。
-                elevation = when {
-                    scrolling -> if (strong) 12.dp else 8.dp
-                    strong -> 28.dp
-                    else -> 18.dp
-                },
+                // 阴影固定：静止和翻页时是同一块玻璃，不会在松手那一刻突然变样。
+                elevation = if (strong) 28.dp else 18.dp,
                 shape = shape,
                 clip = false,
                 ambientColor = Color.Black,
                 spotColor = Color(0xFF24345C),
             )
             .clip(shape)
-            .onGloballyPositioned {
-                // 只在卡片真的换位置时写状态，避免滑动时每帧都触发一次快照提交。
-                val position = it.positionInRoot()
-                if (position != origin.value) origin.value = position
-            }
             .then(
                 if (onClick != null) {
                     Modifier.clickable(
@@ -286,136 +256,119 @@ fun GlassCard(
                 } else Modifier
             ),
     ) {
-        // 1. 背景的折射：同一张壁纸、同一屏幕坐标，被裁进这张卡片。
-        //    这里用 Canvas.drawImage 而不是整屏 Image 图层，位置只在绘制阶段读取，
-        //    翻页时不会因为 onGloballyPositioned 触发整张卡片重组。
-        //    横向滑动时先跳过这块重绘（滑完立刻恢复），它是一帧里最贵的采样。
-        if (refraction && !scrolling && backdrop?.softBitmap != null) {
-            val image = backdrop.softBitmap
-            val screen = backdrop.size
-            Canvas(Modifier.matchParentSize()) {
-                if (screen.width <= 0 || screen.height <= 0) return@Canvas
-                val scaledW = screen.width * 1.16f
-                val scaledH = screen.height * 1.16f
-                val left = (screen.width - scaledW) / 2f - origin.value.x
-                val top = (screen.height - scaledH) / 2f - origin.value.y - screen.height * 0.07f
-                drawImage(
-                    image = image,
-                    srcOffset = IntOffset.Zero,
-                    srcSize = IntSize(image.width, image.height),
-                    dstOffset = IntOffset(left.roundToInt(), top.roundToInt()),
-                    dstSize = IntSize(scaledW.roundToInt(), scaledH.roundToInt()),
-                    alpha = 0.46f,
-                    filterQuality = FilterQuality.Low,
-                )
-            }
-        }
-
-        // 2. 玻璃本身的颜色。上下不同，像一块有厚度的板。
+        // 玻璃本体 + 双层边放在同一个独立图层里：
+        // 滚动 / 翻页时这一整块静态绘制只做合成，不会跟着每帧重录。
         Box(
             Modifier
                 .matchParentSize()
-                .background(
-                    Brush.verticalGradient(
-                        0f to topFill,
-                        0.42f to RilanColors.Deep.copy(alpha = if (strong) 0.58f else 0.65f),
-                        1f to bottomFill,
-                    )
-                )
-        )
-
-        Canvas(Modifier.matchParentSize()) {
-            // 左上冷光、右下暖光，给透明表面一点“被照亮”的方向。
-            drawCircle(
-                brush = Brush.radialGradient(
-                    listOf(RilanColors.Moon.copy(alpha = 0.11f), Color.Transparent),
-                    center = Offset(size.width * 0.08f, 0f),
-                    radius = size.width * 0.86f,
-                ),
-                radius = size.width * 0.86f,
-                center = Offset(size.width * 0.08f, 0f),
+                .graphicsLayer(),
+        ) {
+            // 1~2. 玻璃的颜色、冷光、反光、内阴影、颗粒、顶部高光，全部画进一块
+            //      drawWithCache 的画布里：
+            //      · 渐变画刷只在尺寸变化时构造一次，滚动时不再每帧 new 一堆 Brush/Shader；
+            //      · 外面套一层独立图层，滚动/翻页时这块最贵的绘制不会被重录，
+            //        只重录真正在动的内容，滑动手感才跟得上手指。
+            //      不再在卡片里额外铺一层壁纸折射：那层图只在静止时出现，
+            //      滑动时会整个消失，卡片看起来像「停下就被加了半透明遮罩」。
+            val deepMid = RilanColors.Deep.copy(alpha = if (strong) 0.58f else 0.65f)
+            Spacer(
+                Modifier
+                    .matchParentSize()
+                    .drawWithCache {
+                        val w = size.width
+                        val h = size.height
+                        val fill = Brush.verticalGradient(
+                            0f to topFill,
+                            0.42f to deepMid,
+                            1f to bottomFill,
+                        )
+                        // 左上冷光、右下暖光，给透明表面一点“被照亮”的方向。
+                        val coldLight = Brush.radialGradient(
+                            listOf(RilanColors.Moon.copy(alpha = 0.11f), Color.Transparent),
+                            center = Offset(w * 0.08f, 0f),
+                            radius = w * 0.86f,
+                        )
+                        val warmLight = Brush.radialGradient(
+                            listOf(RilanColors.Dawn.copy(alpha = 0.07f), Color.Transparent),
+                            center = Offset(w * 0.98f, h),
+                            radius = w * 0.7f,
+                        )
+                        // 斜向反光：sheen 由调用方固定，尺寸不变时位置也不变。
+                        val sheenX = w * (sheen.coerceIn(0f, 1f) * 1.15f - 0.1f)
+                        val sheenBrush = Brush.linearGradient(
+                            listOf(
+                                Color.Transparent,
+                                Color.White.copy(alpha = 0.055f),
+                                Color.White.copy(alpha = 0.016f),
+                                Color.Transparent,
+                            ),
+                            start = Offset(sheenX, 0f),
+                            end = Offset(sheenX + w * 0.46f, h),
+                        )
+                        // 底部内阴影，玻璃才有厚度。
+                        val innerShadow = Brush.verticalGradient(
+                            0.64f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.18f),
+                        )
+                        val topLine = Brush.horizontalGradient(
+                            listOf(
+                                Color.Transparent,
+                                Color.White.copy(alpha = 0.34f),
+                                Color.White.copy(alpha = 0.12f),
+                                Color.Transparent,
+                            ),
+                            startX = w * 0.08f,
+                            endX = w * 0.92f,
+                        )
+                        val lineY = 1.2.dp.toPx()
+                        onDrawBehind {
+                            drawRect(fill)
+                            drawCircle(coldLight, radius = w * 0.86f, center = Offset(w * 0.08f, 0f))
+                            drawCircle(warmLight, radius = w * 0.7f, center = Offset(w * 0.98f, h))
+                            drawRect(sheenBrush)
+                            drawRect(innerShadow)
+                            // 颗粒。用一张 96px 的噪点图平铺，避免每帧画几百个圆。
+                            drawRect(GrainBrush, alpha = 0.52f)
+                            // 顶部的一条极细高光，只在玻璃边缘出现。
+                            drawLine(
+                                brush = topLine,
+                                start = Offset(w * 0.08f, lineY),
+                                end = Offset(w * 0.92f, lineY),
+                                strokeWidth = 1.dp.toPx(),
+                            )
+                        }
+                    }
             )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    listOf(RilanColors.Dawn.copy(alpha = 0.07f), Color.Transparent),
-                    center = Offset(size.width * 0.98f, size.height),
-                    radius = size.width * 0.7f,
-                ),
-                radius = size.width * 0.7f,
-                center = Offset(size.width * 0.98f, size.height),
-            )
 
-            // 随卡片滑动移动的斜向反光。
-            val sheenX = size.width * (sheen.coerceIn(0f, 1f) * 1.15f - 0.1f)
-            drawRect(
-                brush = Brush.linearGradient(
-                    listOf(
-                        Color.Transparent,
-                        Color.White.copy(alpha = 0.055f),
-                        Color.White.copy(alpha = 0.016f),
-                        Color.Transparent,
-                    ),
-                    start = Offset(sheenX, 0f),
-                    end = Offset(sheenX + size.width * 0.46f, size.height),
-                )
-            )
-
-            // 底部内阴影，玻璃才有厚度。
-            drawRect(
-                brush = Brush.verticalGradient(
-                    0.64f to Color.Transparent,
-                    1f to Color.Black.copy(alpha = 0.18f),
-                )
-            )
-
-            // 颗粒。用一张 96px 的噪点图平铺，避免每帧画几百个圆。
-            drawRect(brush = GrainBrush, alpha = 0.52f)
-
-            // 顶部的一条极细高光，只在玻璃边缘出现。
-            drawLine(
-                brush = Brush.horizontalGradient(
-                    listOf(
-                        Color.Transparent,
-                        Color.White.copy(alpha = 0.34f),
-                        Color.White.copy(alpha = 0.12f),
-                        Color.Transparent,
-                    ),
-                    startX = size.width * 0.08f,
-                    endX = size.width * 0.92f,
-                ),
-                start = Offset(size.width * 0.08f, 1.2.dp.toPx()),
-                end = Offset(size.width * 0.92f, 1.2.dp.toPx()),
-                strokeWidth = 1.dp.toPx(),
-            )
-        }
-
-        // 3. 双层边：外层是环境光，内层是玻璃的倒角。
-        Box(
-            Modifier
-                .matchParentSize()
-                .border(
-                    width = 1.dp,
-                    brush = Brush.linearGradient(
-                        listOf(
-                            Color.White.copy(alpha = 0.30f),
-                            Color.White.copy(alpha = 0.055f),
-                            RilanColors.Dawn.copy(alpha = 0.13f),
-                            Color.White.copy(alpha = 0.14f),
+            // 3. 双层边：外层是环境光，内层是玻璃的倒角。
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .border(
+                        width = 1.dp,
+                        brush = Brush.linearGradient(
+                            listOf(
+                                Color.White.copy(alpha = 0.30f),
+                                Color.White.copy(alpha = 0.055f),
+                                RilanColors.Dawn.copy(alpha = 0.13f),
+                                Color.White.copy(alpha = 0.14f),
+                            ),
                         ),
-                    ),
-                    shape = shape,
-                )
-        )
-        Box(
-            Modifier
-                .matchParentSize()
-                .padding(1.4.dp)
-                .border(
-                    width = 0.6.dp,
-                    color = Color.White.copy(alpha = 0.075f),
-                    shape = shape,
-                )
-        )
+                        shape = shape,
+                    )
+            )
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .padding(1.4.dp)
+                    .border(
+                        width = 0.6.dp,
+                        color = Color.White.copy(alpha = 0.075f),
+                        shape = shape,
+                    )
+            )
+
+        }
 
         Box(Modifier.padding(contentPadding), content = content)
     }
@@ -706,7 +659,9 @@ fun TextAction(
 @Composable
 fun LoadingLines(modifier: Modifier = Modifier, lines: Int = 3) {
     val transition = rememberInfiniteTransition(label = "shimmer")
-    val alpha by transition.animateFloat(
+    // 只拿到 State，在 graphicsLayer 里读 value：每帧只改图层 alpha，
+    // 不触发重组、也不触发重绘，刷新时滑动不会被几行省略号拖慢。
+    val shimmer = transition.animateFloat(
         initialValue = 0.16f,
         targetValue = 0.38f,
         animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Reverse),
@@ -718,8 +673,9 @@ fun LoadingLines(modifier: Modifier = Modifier, lines: Int = 3) {
                 Modifier
                     .fillMaxWidth(if (index == lines - 1) 0.62f else 1f - index * 0.07f)
                     .height(10.dp)
+                    .graphicsLayer { alpha = shimmer.value * 0.5f }
                     .clip(CircleShape)
-                    .background(Color.White.copy(alpha = alpha * 0.5f))
+                    .background(Color.White)
             )
         }
     }
@@ -728,15 +684,23 @@ fun LoadingLines(modifier: Modifier = Modifier, lines: Int = 3) {
 @Composable
 fun LoadingDots(color: Color = RilanColors.Moon) {
     val transition = rememberInfiniteTransition(label = "dots")
-    val p by transition.animateFloat(
+    val p = transition.animateFloat(
         0f, 1f,
         infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
         label = "dotP",
     )
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
         repeat(3) { i ->
-            val a = 0.22f + 0.78f * ((kotlin.math.sin((p * 2 * Math.PI + i).toFloat()) + 1f) / 2f)
-            Box(Modifier.size(4.dp).clip(CircleShape).background(color.copy(alpha = a)))
+            Box(
+                Modifier
+                    .size(4.dp)
+                    .graphicsLayer {
+                        val phase = (p.value * 2 * Math.PI + i).toFloat()
+                        alpha = 0.22f + 0.78f * ((kotlin.math.sin(phase) + 1f) / 2f)
+                    }
+                    .clip(CircleShape)
+                    .background(color)
+            )
         }
     }
 }
@@ -791,95 +755,22 @@ fun ScreenTitle(
 // 材质工具
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 背景照片：只在 IO 线程解码一次；超宽图降到 2x，避免占太多内存。 */
-private fun photoBitmap(path: String): ImageBitmap? {
+/** 背景照片：只在 IO 线程解码一次，并缩到屏幕长边附近，避免大图 OOM。 */
+private fun photoBitmap(path: String, targetEdge: Int): ImageBitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(path, bounds)
     val longest = maxOf(bounds.outWidth, bounds.outHeight)
+    if (longest <= 0) return null
+    val limit = if (targetEdge > 0) targetEdge else 2200
+    var sample = 1
+    // 卡片和背景都有 1.16 倍放大，留一点余量；inSampleSize 只能是 2 的幂。
+    while (longest / sample > limit * 1.25f) sample *= 2
     val options = BitmapFactory.Options().apply {
-        inSampleSize = if (longest > 2200) 2 else 1
+        inSampleSize = sample
         inPreferredConfig = Bitmap.Config.ARGB_8888
     }
     val source = BitmapFactory.decodeFile(path, options) ?: return null
     return source.asImageBitmap()
-}
-
-/**
- * 壁纸在 IO 线程里降到 ~1/5 分辨率，再做一次可分离盒式模糊。
- *
- * 背景和卡片折射共用这一张图：API 26–30 没有 RenderEffect，Modifier.blur 会是
- * no-op；预先模糊既保证老机器也有磨砂感，又不需要在每张卡上跑全屏高斯模糊。
- */
-private fun frostedBitmap(path: String): ImageBitmap? {
-    val options = BitmapFactory.Options().apply { inSampleSize = 5 }
-    val source = BitmapFactory.decodeFile(path, options) ?: return null
-    val width = source.width
-    val height = source.height
-    if (width <= 0 || height <= 0) {
-        source.recycle()
-        return null
-    }
-    val pixels = IntArray(width * height)
-    source.getPixels(pixels, 0, width, 0, 0, width, height)
-    source.recycle()
-
-    val blurred = boxBlur(boxBlur(pixels, width, height, 3), width, height, 3)
-    val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    output.setPixels(blurred, 0, width, 0, 0, width, height)
-    return output.asImageBitmap()
-}
-
-private fun boxBlur(source: IntArray, width: Int, height: Int, radius: Int): IntArray {
-    if (radius <= 0 || width <= 0 || height <= 0) return source
-    val horizontal = IntArray(source.size)
-    for (y in 0 until height) {
-        val row = y * width
-        for (x in 0 until width) {
-            var a = 0
-            var r = 0
-            var g = 0
-            var b = 0
-            var count = 0
-            for (dx in -radius..radius) {
-                val sx = (x + dx).coerceIn(0, width - 1)
-                val color = source[row + sx]
-                a += color ushr 24
-                r += (color shr 16) and 0xFF
-                g += (color shr 8) and 0xFF
-                b += color and 0xFF
-                count++
-            }
-            horizontal[row + x] = ((a / count) shl 24) or
-                ((r / count) shl 16) or
-                ((g / count) shl 8) or
-                (b / count)
-        }
-    }
-
-    val vertical = IntArray(source.size)
-    for (x in 0 until width) {
-        for (y in 0 until height) {
-            var a = 0
-            var r = 0
-            var g = 0
-            var b = 0
-            var count = 0
-            for (dy in -radius..radius) {
-                val sy = (y + dy).coerceIn(0, height - 1)
-                val color = horizontal[sy * width + x]
-                a += color ushr 24
-                r += (color shr 16) and 0xFF
-                g += (color shr 8) and 0xFF
-                b += color and 0xFF
-                count++
-            }
-            vertical[y * width + x] = ((a / count) shl 24) or
-                ((r / count) shl 16) or
-                ((g / count) shl 8) or
-                (b / count)
-        }
-    }
-    return vertical
 }
 
 private val Grain: ImageBitmap by lazy {

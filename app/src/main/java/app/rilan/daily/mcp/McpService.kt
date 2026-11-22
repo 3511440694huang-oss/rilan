@@ -39,7 +39,13 @@ class McpService : Service() {
             return START_NOT_STICKY
         }
 
-        startForeground(NOTIFICATION_ID, buildNotification())
+        // Android 14/15 从后台拉起 dataSync 前台服务会被系统拒绝（ForegroundServiceStartNotAllowed）。
+        // 这里必须自己兜住：服务主线程抛出的异常没人能接，会直接把整个进程带走。
+        val shown = runCatching { startForeground(NOTIFICATION_ID, buildNotification()) }.isSuccess
+        if (!shown) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val result = repo.startMcpServerOnly()
         if (result.isFailure) {
             stopForegroundCompat()

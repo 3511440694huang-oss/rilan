@@ -60,6 +60,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onForeground() = repo.onForeground()
 
+    /** 前台心跳：天气轻量轮询 + 信息流定时刷新。 */
+    fun onTick() = repo.onTick()
+
+    /** 切到信息流页时触发一次「打开即刷新」。 */
+    fun onFeedOpened() = repo.onFeedOpened()
+
     fun ensureMcpRunningIfEnabled() = repo.ensureMcpRunningIfEnabled()
 
     fun refreshAll() = repo.refreshAll()

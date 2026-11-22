@@ -235,7 +235,9 @@ object RssParser {
             // 没有原文链接时退回该期早报的链接，保证条目可点
             val url = httpOnly(resolveUrl(feed.url, entry.second)).ifBlank { link }
             NewsItem(
-                id = stableId(feed.id, url.ifBlank { title }),
+                // 早报的 <li> 经常没有原文链接，会一起退回同一个本期链接；
+                // id 必须再带上标题，否则多条共用一个 id，信息流列表的 key 会撞。
+                id = stableId(feed.id, url, title),
                 title = title,
                 url = url,
                 source = JUYA_SOURCE,

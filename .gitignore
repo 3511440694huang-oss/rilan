@@ -9,3 +9,5 @@ APK/*.apk
 .idea/
 icon-art.png
 icon-flat-2048.png
+*.idsig
+.oil-ui/

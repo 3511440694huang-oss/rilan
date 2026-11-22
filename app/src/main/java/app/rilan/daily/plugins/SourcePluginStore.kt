@@ -58,7 +58,11 @@ class SourcePluginStore(context: Context) {
     /** 给 UI 展示的插件目录，便于用户去文件管理器手动添加。 */
     val directoryPath: String = directory.absolutePath
 
-    init {
+    /**
+     * 首次扫描目录 + 写入默认插件。以前在构造函数里做，冷启动时占着主线程；
+     * 现在由 AppRepository.bootstrap 在 IO 线程调用。
+     */
+    fun warmUp() {
         runCatching { ensureSeeded() }
         reload()
     }

@@ -6,7 +6,6 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -28,14 +27,15 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,7 +80,6 @@ internal fun WeatherHero(
     onRefresh: () -> Unit,
     onRelocate: () -> Unit,
     sheen: Float = 0.4f,
-    scrolling: Boolean = false,
     bottomInset: Dp = 96.dp,
     modifier: Modifier = Modifier,
 ) {
@@ -88,8 +87,6 @@ internal fun WeatherHero(
         modifier = modifier.fillMaxSize(),
         shape = RoundedCornerShape(32.dp),
         strong = true,
-        refraction = true,
-        scrolling = scrolling,
         sheen = sheen,
         contentPadding = PaddingValues(0.dp),
     ) {
@@ -108,7 +105,6 @@ internal fun WeatherHero(
                     refreshing = refreshing,
                     locating = locating,
                     locationError = locationError,
-                    scrolling = scrolling,
                     onRelocate = onRelocate,
                 )
                 if (error != null) {
@@ -138,35 +134,47 @@ internal fun WeatherHero(
 @Composable
 private fun WeatherAtmosphere(weather: WeatherData?) {
     val accent = weather?.let { weatherTint(it) } ?: RilanColors.Moon
-    Canvas(Modifier.fillMaxSize()) {
-        drawCircle(
-            brush = Brush.radialGradient(
-                listOf(accent.copy(alpha = 0.16f), Color.Transparent),
-                center = Offset(size.width * 0.82f, size.height * 0.10f),
-                radius = size.width * 0.78f,
-            ),
-            radius = size.width * 0.78f,
-            center = Offset(size.width * 0.82f, size.height * 0.10f),
-        )
-        drawCircle(
-            brush = Brush.radialGradient(
-                listOf(RilanColors.Dawn.copy(alpha = 0.07f), Color.Transparent),
-                center = Offset(size.width * 0.02f, size.height * 0.92f),
-                radius = size.width * 0.66f,
-            ),
-            radius = size.width * 0.66f,
-            center = Offset(size.width * 0.02f, size.height * 0.92f),
-        )
-        // 一条很淡的地平线，把天气卡和其他卡区分开
-        drawLine(
-            brush = Brush.horizontalGradient(
-                listOf(Color.Transparent, accent.copy(alpha = 0.18f), Color.Transparent)
-            ),
-            start = Offset(size.width * 0.12f, size.height * 0.49f),
-            end = Offset(size.width * 0.88f, size.height * 0.49f),
-            strokeWidth = 0.8.dp.toPx(),
-        )
-    }
+    // 整屏大气光是一块静态绘制：画刷按尺寸缓存一次，并放进独立图层。
+    // 否则天气卡里内容一滚动，这块径向渐变就会跟着每帧重录一次。
+    Spacer(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer()
+            .drawWithCache {
+                val w = size.width
+                val h = size.height
+                val cool = Offset(w * 0.82f, h * 0.10f)
+                val coolR = w * 0.78f
+                val coolBrush = Brush.radialGradient(
+                    listOf(accent.copy(alpha = 0.16f), Color.Transparent),
+                    center = cool,
+                    radius = coolR,
+                )
+                val warm = Offset(w * 0.02f, h * 0.92f)
+                val warmR = w * 0.66f
+                val warmBrush = Brush.radialGradient(
+                    listOf(RilanColors.Dawn.copy(alpha = 0.07f), Color.Transparent),
+                    center = warm,
+                    radius = warmR,
+                )
+                // 一条很淡的地平线，把天气卡和其他卡区分开
+                val horizon = Brush.horizontalGradient(
+                    listOf(Color.Transparent, accent.copy(alpha = 0.18f), Color.Transparent)
+                )
+                val lineY = h * 0.49f
+                val stroke = 0.8.dp.toPx()
+                onDrawBehind {
+                    drawCircle(coolBrush, radius = coolR, center = cool)
+                    drawCircle(warmBrush, radius = warmR, center = warm)
+                    drawLine(
+                        brush = horizon,
+                        start = Offset(w * 0.12f, lineY),
+                        end = Offset(w * 0.88f, lineY),
+                        strokeWidth = stroke,
+                    )
+                }
+            }
+    )
 }
 
 @Composable
@@ -176,7 +184,6 @@ private fun WeatherTop(
     refreshing: Boolean,
     locating: Boolean,
     locationError: String?,
-    scrolling: Boolean,
     onRelocate: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -209,23 +216,23 @@ private fun WeatherTop(
 
             Spacer(Modifier.height(7.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // 只有正在定位时才跑无限脉冲；平时用固定透明度，省掉每帧一次重组。
-                val pinAlpha = if (locating) {
-                    val pinPulse = rememberInfiniteTransition(label = "pin")
-                    val value by pinPulse.animateFloat(
+                // 只有正在定位时才跑无限脉冲；平时用固定透明度。
+                // 动画值在 graphicsLayer 里读，只改图层 alpha，不重组、不重绘。
+                val pinPulse = if (locating) {
+                    rememberInfiniteTransition(label = "pin").animateFloat(
                         0.45f, 1f,
                         infiniteRepeatable(tween(1600, easing = LinearEasing), RepeatMode.Reverse),
                         label = "pinAlpha",
                     )
-                    value
                 } else {
-                    0.9f
+                    null
                 }
                 Box(
                     Modifier
                         .size(5.dp)
+                        .graphicsLayer { alpha = pinPulse?.value ?: 0.9f }
                         .clip(CircleShape)
-                        .background(RilanColors.Moon.copy(alpha = pinAlpha))
+                        .background(RilanColors.Moon)
                 )
                 Spacer(Modifier.width(7.dp))
                 Text(
@@ -266,7 +273,6 @@ private fun WeatherTop(
             HeroWeatherGlyph(
                 code = weather.weatherCode,
                 isDay = weather.isDay,
-                scrolling = scrolling,
                 modifier = Modifier.size(92.dp),
             )
         } else {
@@ -289,14 +295,10 @@ private fun WeatherTop(
 private fun HeroWeatherGlyph(
     code: Int,
     isDay: Boolean,
-    scrolling: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    if (scrolling) {
-        WeatherMiniGlyph(code = code, isDay = isDay, modifier = modifier)
-    } else {
-        WeatherGlyph(code = code, isDay = isDay, modifier = modifier)
-    }
+    // 静止和横向滑动时保持同一个图标，不再在滑动瞬间换成另一套静态笔触。
+    WeatherGlyph(code = code, isDay = isDay, modifier = modifier)
 }
 
 @Composable

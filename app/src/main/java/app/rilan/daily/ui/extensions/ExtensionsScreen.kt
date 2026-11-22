@@ -77,6 +77,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -98,6 +99,7 @@ import app.rilan.daily.core.DEEPSEEK_MODEL_IDS
 import app.rilan.daily.mcp.McpServerState
 import app.rilan.daily.mcp.McpTestState
 import app.rilan.daily.plugins.SourcePlugin
+import app.rilan.daily.core.CrashLog
 import app.rilan.daily.schedule.DailyBriefNotifier
 import app.rilan.daily.ui.components.ErrorLine
 import app.rilan.daily.ui.components.GlassCard
@@ -754,8 +756,9 @@ private fun ServiceTab(
     var showToken by remember { mutableStateOf(false) }
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
 
-    LaunchedEffect(state.running, state.startedAt) {
-        if (!state.running || state.startedAt <= 0L) return@LaunchedEffect
+    // 只在展开 MCP 卡片时才每秒刷新运行时长；收起时不要为一行摘要整卡重组。
+    LaunchedEffect(state.running, state.startedAt, expanded) {
+        if (!expanded || !state.running || state.startedAt <= 0L) return@LaunchedEffect
         while (true) {
             now = System.currentTimeMillis()
             delay(1_000L)
@@ -914,7 +917,9 @@ private fun ServiceTab(
 @Composable
 private fun StatusDot(running: Boolean) {
     val transition = rememberInfiniteTransition(label = "mcpDot")
-    val pulse by transition.animateFloat(
+    // 呼吸圆环用图层 scale/alpha 做，不再每帧改 size——
+    // 改 size 会每帧重新测量布局，整个扩展页都要跟着重排。
+    val pulse = transition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -927,9 +932,16 @@ private fun StatusDot(running: Boolean) {
         if (running) {
             Box(
                 Modifier
-                    .size(8.dp + 10.dp * pulse)
+                    .size(8.dp)
+                    .graphicsLayer {
+                        val p = pulse.value
+                        val s = 1f + 10f / 8f * p
+                        scaleX = s
+                        scaleY = s
+                        alpha = (1f - p) * 0.28f
+                    }
                     .clip(CircleShape)
-                    .background(RilanColors.Mint.copy(alpha = (1f - pulse) * 0.28f))
+                    .background(RilanColors.Mint)
             )
         }
         Box(
@@ -1277,6 +1289,8 @@ private fun MoreTab(
             onRequestNotifications = { onRequestNotifications?.invoke() },
         )
 
+        CrashLogCard()
+
         GlassCard(
             Modifier.fillMaxWidth(),
             strong = true,
@@ -1338,6 +1352,62 @@ private fun MoreTab(
                             color = RilanColors.TextTertiary,
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CrashLogCard() {
+    val context = LocalContext.current
+    var text by remember { mutableStateOf(CrashLog.read(context)) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
+
+    GlassCard(
+        Modifier.fillMaxWidth(),
+        strong = true,
+        shape = RoundedCornerShape(22.dp),
+        contentPadding = PaddingValues(16.dp),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionLabel("崩溃日志", RilanColors.Gold)
+            Text(
+                if (text == null) {
+                    "还没有记录。以后如果闪退，堆栈会自动保存在本机，可以在这里复制给开发者。"
+                } else {
+                    "最近一次闪退的堆栈已保存在本机；点「查看」展开，复制后可发出去。"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = RilanColors.TextTertiary,
+            )
+            text?.let { crash ->
+                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    TextAction(if (expanded) "收起" else "查看", onClick = { expanded = !expanded })
+                    TextAction("复制", onClick = { copyText(context, crash, "崩溃日志已复制") })
+                    TextAction(
+                        "清除",
+                        onClick = {
+                            CrashLog.clear(context)
+                            text = null
+                            expanded = false
+                        },
+                    )
+                }
+                AnimatedVisibility(visible = expanded) {
+                    Text(
+                        crash,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp,
+                        ),
+                        color = RilanColors.TextSecondary,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0x14FFFFFF), RoundedCornerShape(12.dp))
+                            .padding(10.dp),
+                    )
                 }
             }
         }

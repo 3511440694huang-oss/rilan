@@ -8,7 +8,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -19,6 +18,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import app.rilan.daily.ui.theme.RilanColors
 import kotlin.math.PI
@@ -71,7 +71,9 @@ fun WeatherGlyph(
 ) {
     val kind = weatherGlyphKind(code, isDay)
     val transition = rememberInfiniteTransition(label = "weatherGlyph")
-    val spin by transition.animateFloat(
+    // 动画值只拿 State，不在组合阶段解包：解包会让这枚图标每帧重组一次，
+    // 进而连带整张卡片重组。下面在 draw 里读 value，只失效这一块画布。
+    val spin = transition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(
@@ -80,7 +82,7 @@ fun WeatherGlyph(
         ),
         label = "glyphSpin",
     )
-    val drift by transition.animateFloat(
+    val drift = transition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -89,7 +91,7 @@ fun WeatherGlyph(
         ),
         label = "glyphDrift",
     )
-    val fall by transition.animateFloat(
+    val fall = transition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -98,7 +100,7 @@ fun WeatherGlyph(
         ),
         label = "glyphFall",
     )
-    val pulse by transition.animateFloat(
+    val pulse = transition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -108,8 +110,13 @@ fun WeatherGlyph(
         label = "glyphPulse",
     )
 
-    Canvas(modifier) {
-        drawFullGlyph(kind, spin, drift, fall, pulse)
+    Canvas(
+        modifier
+            // 独立绘制层：无限动画每帧只重录这枚 92dp 小图标，
+            // 滚动时也不会把整张玻璃卡（渐变 + 噪点）一起重录。
+            .graphicsLayer(),
+    ) {
+        drawFullGlyph(kind, spin.value, drift.value, fall.value, pulse.value)
     }
 }
 

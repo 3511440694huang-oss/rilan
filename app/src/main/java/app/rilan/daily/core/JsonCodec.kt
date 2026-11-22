@@ -254,7 +254,9 @@ object JsonCodec {
                 }
                 NewsSection(
                     category = Category.parse(o.optString("category")),
-                    items = items,
+                    // 旧版本写下的缓存可能带重复条目；同一板块内 id 必须唯一，
+                    // 否则信息流 LazyColumn 的 key 会撞车、整页崩掉。
+                    items = items.distinctBy { it.id },
                     updatedAt = o.optLong("updatedAt"),
                     error = o.optString("error").takeIf { it.isNotBlank() && it != "null" },
                 )

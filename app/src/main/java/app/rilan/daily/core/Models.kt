@@ -180,6 +180,17 @@ data class WeatherData(
             .joinToString(" · ")
 }
 
+data class WeatherNow(
+    val temp: Double,
+    val feelsLike: Double,
+    val humidity: Int,
+    val windSpeed: Double,
+    val windDirection: Int,
+    val weatherCode: Int,
+    val isDay: Boolean,
+    val fetchedAt: Long,
+)
+
 data class CityResult(
     val name: String,
     val admin: String,
@@ -422,7 +433,8 @@ fun relativeTimeLabel(epochMillis: Long, now: Long = System.currentTimeMillis())
     if (epochMillis <= 0L) return ""
     val diff = (now - epochMillis).coerceAtLeast(0L) / 1000L
     return when {
-        diff < 60L -> "刚刚"
+        diff < 15L -> "刚刚"
+        diff < 60L -> "${diff} 秒前"
         diff < 3600L -> "${diff / 60} 分钟前"
         diff < 86_400L -> "${diff / 3600} 小时前"
         diff < 7 * 86_400L -> "${diff / 86_400} 天前"

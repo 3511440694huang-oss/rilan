@@ -17,6 +17,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,11 +45,19 @@ private class SourceError(message: String) : Exception(message)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** 同时最多 8 个请求在飞，热搜 + 来源插件一起算；减少慢源拖住整轮刷新。 */
-private const val MAX_CONCURRENCY = 8
+private const val MAX_CONCURRENCY = 10
 
-/** 热搜接口只返回榜单，12 秒读不到就没必要再等；单个源慢不该拖住整轮内容刷新。 */
-private const val HOT_CONNECT_TIMEOUT_MS = 8_000
-private const val HOT_READ_TIMEOUT_MS = 12_000
+/** 热搜接口只返回榜单，8 秒读不到就没必要再等；单个源慢不该拖住整轮内容刷新。 */
+private const val HOT_CONNECT_TIMEOUT_MS = 5_000
+private const val HOT_READ_TIMEOUT_MS = 8_000
+
+/**
+ * 插件源（RSS / JSON）的复用窗口。
+ *
+ * 前台每 3 分钟会刷一次信息流，但热搜 3 分钟一变、RSS 通常 10 分钟以上才更新；
+ * 插件在窗口内直接用上一轮成功结果，热搜照常每次都拉，界面依旧「刚刚更新」。
+ */
+private const val PLUGIN_CACHE_TTL_MS = 10 * 60_000L
 
 private const val WEIBO_URL = "https://weibo.com/ajax/side/hotSearch"
 private const val BILIBILI_URL = "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1"
@@ -100,8 +109,15 @@ class ContentFetcher {
 
     private val pluginFetcher = PluginFetcher()
 
+    /** 插件源最近一次成功结果；RSS 更新慢，没必要跟热搜一样每 3 分钟重新解析。 */
+    private class CachedPlugin(val at: Long, val outcome: Outcome)
+
+    private val pluginCache = ConcurrentHashMap<String, CachedPlugin>()
+
     /**
      * 抓取全部内容。永不抛网络/解析异常：失败信息放在 [NewsSection.error] 里。
+     *
+     * @param force 忽略插件级缓存，所有来源都重新请求（用户手动刷新 / 设置变更后）。
      *
      * 只返回有内容或有错误的板块，顺序固定为
      * GENERAL、AI、WEIBO、BILIBILI、DOUYIN、SECURITY、WORLD。
@@ -112,17 +128,33 @@ class ContentFetcher {
         includeWeibo: Boolean = true,
         includeBilibili: Boolean = true,
         includeDouyin: Boolean = true,
+        force: Boolean = false,
     ): List<NewsSection> {
         val now = System.currentTimeMillis()
         val tasks = ArrayList<FetchTask>(plugins.size + 3)
+        if (pluginCache.size > 128) pluginCache.clear()
 
         plugins
             .filter { it.enabled && it.url.isNotBlank() }
             .forEach { plugin ->
-                tasks += FetchTask(plugin.category) { loadPlugin(plugin, blockedWords) }
+                // 插件 id + url 一起做键：用户改了地址就会自然失效。
+                val key = "${plugin.id}|${plugin.url}"
+                val cached = pluginCache[key]
+                tasks += FetchTask(plugin.category) {
+                    if (!force && cached != null && now - cached.at < PLUGIN_CACHE_TTL_MS) {
+                        cached.outcome
+                    } else {
+                        loadPlugin(plugin, blockedWords).also { outcome ->
+                            // 只缓存成功结果；失败下一轮重试，不把错误钉住 10 分钟。
+                            if (outcome.error == null || outcome.items.isNotEmpty()) {
+                                pluginCache[key] = CachedPlugin(System.currentTimeMillis(), outcome)
+                            }
+                        }
+                    }
+                }
             }
 
-        // 三个内置热搜与来源插件一起排队，同样受 6 并发限制；可在扩展页关掉
+        // 三个内置热搜与来源插件一起排队，同样受并发上限约束；可在扩展页关掉
         if (includeWeibo) tasks += FetchTask(Category.WEIBO) { loadWeibo(blockedWords) }
         if (includeBilibili) tasks += FetchTask(Category.BILIBILI) { loadBilibili(blockedWords) }
         if (includeDouyin) tasks += FetchTask(Category.DOUYIN) { loadDouyin(blockedWords) }
@@ -133,7 +165,7 @@ class ContentFetcher {
     // ── 并发调度 ────────────────────────────────────────────────────────────
 
     /**
-     * 固定 6 个工作者消费任务队列：任意时刻最多 6 个协程在跑，
+     * 固定工作者消费任务队列：任意时刻最多 [MAX_CONCURRENCY] 个协程在跑，
      * 且慢的源不会像 chunked 那样卡住同批其他源。
      */
     private suspend fun runLimited(tasks: List<FetchTask>): List<Outcome> = coroutineScope {
@@ -212,10 +244,16 @@ class ContentFetcher {
         return picked
     }
 
+    /**
+     * 每个板块最多保留多少条。
+     *
+     * 1.7 起信息流不再在界面上截断，这里就是最终可见条数；把上限提到
+     * 「各来源一次抓回来的量级」，向下滑能看到当天全部抓到的内容。
+     */
     private fun limitOf(category: Category): Int = when (category) {
-        Category.GENERAL -> 14
-        Category.SECURITY, Category.WORLD -> 8
-        else -> 15
+        Category.GENERAL -> 40
+        Category.SECURITY, Category.WORLD -> 20
+        else -> 30
     }
 
     private fun titleKey(title: String): String =

@@ -61,13 +61,14 @@ class AppRepository(context: Context) : McpHost {
     private val _settings = MutableStateFlow(initialSettings)
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
-    private val _home = MutableStateFlow(buildInitialHome())
+    /** 首帧先给空状态（loading=true），磁盘缓存稍后在 IO 线程读进来。 */
+    private val _home = MutableStateFlow(HomeState())
     val home: StateFlow<HomeState> = _home.asStateFlow()
 
-    private val _records = MutableStateFlow(prefs.loadRecords())
+    private val _records = MutableStateFlow<List<NewsRecord>>(emptyList())
     val records: StateFlow<List<NewsRecord>> = _records.asStateFlow()
 
-    private val _digests = MutableStateFlow(prefs.loadDigests())
+    private val _digests = MutableStateFlow<Map<SummaryPeriod, AiDigest>>(emptyMap())
     val digests: StateFlow<Map<SummaryPeriod, AiDigest>> = _digests.asStateFlow()
 
     /** 正在用 DeepSeek 直连生成的周期；null 表示空闲。 */
@@ -107,6 +108,9 @@ class AppRepository(context: Context) : McpHost {
     private var activeRefreshes = 0
 
     @Volatile private var weatherJob: Job? = null
+    /** 轻量实时天气轮询；和全量预报分开，避免互相取消。 */
+    @Volatile private var fastWeatherJob: Job? = null
+    @Volatile private var lastFastWeatherAt = 0L
     @Volatile private var contentJob: Job? = null
     @Volatile private var wallpaperJob: Job? = null
     @Volatile private var aiJob: Job? = null
@@ -136,26 +140,63 @@ class AppRepository(context: Context) : McpHost {
             current.dailyNoticeMinuteOfDay / 60,
             current.dailyNoticeMinuteOfDay % 60,
         )
-        refreshDailyAiForToday()
         scope.launch {
+            // 磁盘缓存 / 历史 / 插件目录都可能很大，全部放到 IO 线程读，
+            // 冷启动时主线程只负责把空状态画出来，避免 ANR 被系统当成闪退杀掉。
+            val cached = runCatching { buildInitialHome() }.getOrNull()
+            if (cached != null) {
+                _home.update { h ->
+                    val mergedSections = if (h.sections.isEmpty()) cached.sections else h.sections
+                    val mergedWeather = h.weather ?: cached.weather
+                    h.copy(
+                        wallpaper = h.wallpaper ?: cached.wallpaper,
+                        weather = mergedWeather,
+                        sections = mergedSections,
+                        loading = mergedWeather == null && mergedSections.isEmpty(),
+                        lastUpdated = maxOf(h.lastUpdated, cached.lastUpdated),
+                        weatherInsight = if (h.weatherInsight.content.isBlank()) cached.weatherInsight else h.weatherInsight,
+                        dailyBrief = if (h.dailyBrief.content.isBlank()) cached.dailyBrief else h.dailyBrief,
+                    )
+                }
+            }
+            _records.value = runCatching { prefs.loadRecords() }.getOrDefault(emptyList())
+            _digests.value = runCatching { prefs.loadDigests() }.getOrDefault(emptyMap())
+            pluginStore.warmUp()
+            refreshDailyAiForToday()
             // 壁纸、天气、信息流互不阻塞：壁纸最慢，不能挡在天气前面。
             launch { refreshWallpaperIfStale() }
-            if (isWeatherStale()) refreshWeather()
+            // 缓存刚读出来，先用一次轻量实时请求把温度拉新；全量预报按 10 分钟周期补。
+            if (isWeatherStale()) refreshWeather() else refreshWeatherFast()
             if (isContentStale()) triggerContentRefresh()
         }
     }
 
     fun onForeground() {
+        onTick()
+        ensureMcpRunningIfEnabled()
+    }
+
+    /**
+     * 前台心跳（约 20 秒一次）：天气先走轻量实时轮询，全量预报按长周期补；
+     * 信息流按 [CONTENT_TTL_MS] 刷新。所有请求都在仓库里做去重与节流。
+     */
+    fun onTick() {
         refreshDailyAiForToday()
-        if (isWeatherStale()) refreshWeather()
+        if (isWeatherStale()) refreshWeather() else refreshWeatherFast()
         if (isContentStale()) triggerContentRefresh()
         refreshWallpaperIfStale()
-        ensureMcpRunningIfEnabled()
+    }
+
+    /** 切到信息流卡片时调用：比定时更早地把「刚打开这一页」的内容刷新一遍。 */
+    fun onFeedOpened() {
+        val last = _settings.value.lastContentAt
+        if (last <= 0L || System.currentTimeMillis() - last > 60_000L) triggerContentRefresh()
     }
 
     fun refreshAll() {
         refreshWeatherInternal(forceLocate = true)
-        triggerContentRefresh()
+        // 手动刷新绕过插件缓存：用户点刷新就是要立刻看到每个源的最新内容。
+        triggerContentRefresh(force = true)
         refreshWallpaper()
     }
 
@@ -181,12 +222,12 @@ class AppRepository(context: Context) : McpHost {
 
     private fun isWeatherStale(): Boolean {
         val last = _settings.value.lastWeatherAt
-        return last <= 0L || System.currentTimeMillis() - last > 3 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > WEATHER_FULL_TTL_MS
     }
 
     private fun isContentStale(): Boolean {
         val last = _settings.value.lastContentAt
-        return last <= 0L || System.currentTimeMillis() - last > 6 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > CONTENT_TTL_MS
     }
 
     fun refreshWeather() {
@@ -229,12 +270,14 @@ class AppRepository(context: Context) : McpHost {
 
     private fun isLocationStale(): Boolean {
         val last = _settings.value.lastLocationAt
-        return last <= 0L || System.currentTimeMillis() - last > 30 * 60_000L
+        return last <= 0L || System.currentTimeMillis() - last > LOCATION_TTL_MS
     }
 
     private fun refreshWeatherInternal(forceLocate: Boolean) {
         if (weatherJob?.isActive == true) return
         weatherJob = scope.launch {
+            // 全量刷新会整体替换天气对象，先停掉可能回来的轻量轮询，避免旧值覆盖新值。
+            fastWeatherJob?.cancel()
             beginRefresh()
             var early: Deferred<WeatherData>? = null
             try {
@@ -344,6 +387,53 @@ class AppRepository(context: Context) : McpHost {
         }
     }
 
+    /**
+     * 轻量实时天气：只更新当前温度 / 体感 / 湿度 / 风 / 天气现象，不碰未来预报。
+     *
+     * 失败完全静默：保留上一次成功的天气，不弹错误、不打断卡片动画。
+     */
+    private fun refreshWeatherFast() {
+        val weather = _home.value.weather ?: return
+        if (weatherJob?.isActive == true) return
+        if (fastWeatherJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (lastFastWeatherAt > 0L && now - lastFastWeatherAt < WEATHER_FAST_INTERVAL_MS) return
+        val settings = _settings.value
+        fastWeatherJob = scope.launch {
+            try {
+                val fresh = weatherClient.fetchCurrent(settings) ?: return@launch
+                // 全量刷新在拿到新数据前不要被轻量结果干扰
+                if (weatherJob?.isActive == true) return@launch
+                val current = _home.value.weather ?: return@launch
+                if (current.city != settings.city) return@launch
+                lastFastWeatherAt = System.currentTimeMillis()
+                val merged = current.copy(
+                    currentTemp = fresh.temp,
+                    feelsLike = fresh.feelsLike,
+                    humidity = fresh.humidity,
+                    windSpeed = fresh.windSpeed,
+                    windDirection = fresh.windDirection,
+                    weatherCode = fresh.weatherCode,
+                    isDay = fresh.isDay,
+                    updatedAt = fresh.fetchedAt,
+                )
+                prefs.saveWeatherCache(merged)
+                _home.update {
+                    it.copy(
+                        weather = merged,
+                        weatherError = null,
+                        lastUpdated = maxOf(it.lastUpdated, fresh.fetchedAt),
+                    )
+                }
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (t: Throwable) {
+                // 轻量轮询失败不写错误；记下失败时间做退避，别在弱网里每 20 秒锤一次。
+                lastFastWeatherAt = System.currentTimeMillis()
+            }
+        }
+    }
+
     private fun applyPlace(place: PlaceInfo) {
         mutateSettings {
             it.copy(
@@ -358,7 +448,7 @@ class AppRepository(context: Context) : McpHost {
         }
     }
 
-    fun triggerContentRefresh() {
+    fun triggerContentRefresh(force: Boolean = false) {
         if (contentJob?.isActive == true) return
         contentJob = scope.launch {
             beginRefresh()
@@ -369,6 +459,7 @@ class AppRepository(context: Context) : McpHost {
                     includeWeibo = _settings.value.weiboHotEnabled,
                     includeBilibili = _settings.value.bilibiliHotEnabled,
                     includeDouyin = _settings.value.douyinHotEnabled,
+                    force = force,
                 )
                 if (fetched.isEmpty()) {
                     _home.update {
@@ -453,6 +544,8 @@ class AppRepository(context: Context) : McpHost {
         val autoLocationChanged = sanitized.autoLocation != old.autoLocation
         val aiChanged = sanitized.deepseekApiKey != old.deepseekApiKey ||
             sanitized.deepseekModel != old.deepseekModel
+        // 屏蔽词变了，插件缓存里是旧过滤结果，必须强制重抓一遍。
+        val wordsChanged = sanitized.blockedWords != old.blockedWords
         val normalized = if (cityChanged || !sanitized.autoLocation) {
             sanitized.copy(place = "")
         } else {
@@ -476,6 +569,9 @@ class AppRepository(context: Context) : McpHost {
             _home.update { it.copy(weatherInsight = AiText()) }
             refreshWeather()
             triggerContentRefresh()
+        }
+        if (wordsChanged) {
+            triggerContentRefresh(force = true)
         }
         if (reminderChanged) {
             ReminderScheduler.reschedule(appContext, normalized.reminderMinuteOfDay)
@@ -703,6 +799,24 @@ class AppRepository(context: Context) : McpHost {
     }
 
     private companion object {
+        /** 全量预报（逐小时 / 7 天 / 空气质量）的刷新周期。 */
+        const val WEATHER_FULL_TTL_MS = 10 * 60_000L
+
+        /**
+         * 轻量实时天气轮询：前台心跳每 20 秒来一次，这里限流到 60 秒一次。
+         * Open-Meteo 的 current 本身就是 15 分钟粒度，60 秒已经是 15 倍过采样。
+         */
+        const val WEATHER_FAST_INTERVAL_MS = 60_000L
+
+        /**
+         * 信息流刷新周期：热搜接口 3 分钟一刷，插件源由 ContentFetcher 的
+         * 10 分钟缓存兜住，所以这里可以把心跳调快而不产生大量重复下载。
+         */
+        const val CONTENT_TTL_MS = 3 * 60_000L
+
+        /** 自动定位周期；10 分钟以内移动不会频繁唤醒 GPS。 */
+        const val LOCATION_TTL_MS = 10 * 60_000L
+
         const val DAILY_BRIEF_SYSTEM =
             "你是「日览」的中文编辑，擅长把碎片信息收拢成一天的主线。" +
                 "语气克制、具体、不空泛；只输出正文，不解释你的写作过程。"
@@ -841,7 +955,7 @@ class AppRepository(context: Context) : McpHost {
         val result = pluginStore.saveJson(rawJson, originalId)
         return result.fold(
             onSuccess = {
-                triggerContentRefresh()
+                triggerContentRefresh(force = true)
                 null
             },
             onFailure = { it.message?.takeIf { msg -> msg.isNotBlank() } ?: "插件保存失败" },
@@ -850,12 +964,12 @@ class AppRepository(context: Context) : McpHost {
 
     fun deletePlugin(id: String) {
         pluginStore.delete(id)
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
     }
 
     fun togglePlugin(id: String, enabled: Boolean) {
         pluginStore.setEnabled(id, enabled)
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
     }
 
     fun setHotListEnabled(category: Category, enabled: Boolean) {
@@ -1298,26 +1412,26 @@ class AppRepository(context: Context) : McpHost {
     override suspend fun addSource(pluginJson: String): JSONObject {
         val result = pluginStore.saveJson(pluginJson)
         val plugin = result.getOrElse { throw IllegalArgumentException(it.message ?: "插件保存失败") }
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
         return JSONObject(plugin.toJson())
     }
 
     override suspend fun removeSource(id: String): Boolean {
         if (pluginStore.get(id) == null) return false
         pluginStore.delete(id)
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
         return true
     }
 
     override suspend fun setSourceEnabled(id: String, enabled: Boolean): Boolean {
         if (pluginStore.get(id) == null) return false
         pluginStore.setEnabled(id, enabled)
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
         return true
     }
 
     override suspend fun refreshContent(): String {
-        triggerContentRefresh()
+        triggerContentRefresh(force = true)
         val job = contentJob
         val finished = if (job != null) {
             kotlinx.coroutines.withTimeoutOrNull(60_000L) { job.join() } != null

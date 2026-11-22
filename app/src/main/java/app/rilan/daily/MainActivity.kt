@@ -23,7 +23,8 @@ class MainActivity : ComponentActivity() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
             window.isNavigationBarContrastEnforced = false
         }
-        (application as RilanApp).repo.ensureMcpRunningIfEnabled()
+        // MCP 不在 onCreate 里同步启动：RilanRoot 在 ON_RESUME 会调用同一入口，
+        // 那时应用已在前台，前台服务不会被 Android 14/15 的后台启动规则拒绝。
         setContent {
             RilanTheme {
                 RilanRoot(viewModel)

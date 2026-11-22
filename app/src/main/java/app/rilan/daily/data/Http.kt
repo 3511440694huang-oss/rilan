@@ -6,13 +6,24 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.Charset
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.GZIPInputStream
 
 class HttpException(val statusCode: Int, message: String) : Exception(message)
 
+/** GET 的原始结果：状态码、正文和响应头（小写键），304 也走这条路径。 */
+private data class HttpRaw(
+    val status: Int,
+    val bytes: ByteArray,
+    val headers: Map<String, String>,
+)
+
 /**
  * 极简 HTTP 客户端：不引第三方库，减少包体和构建风险。
  * 所有请求都带移动端 UA 与中文 Accept-Language。
+ *
+ * 连接复用：成功读完响应后**不调用** `disconnect()`，让 HttpURLConnection
+ * 把 TLS 连接还给连接池，下一轮十几个来源刷新时省掉重新握手。
  */
 object Http {
 
@@ -22,11 +33,39 @@ object Http {
     suspend fun getText(
         url: String,
         headers: Map<String, String> = emptyMap(),
-        connectTimeoutMs: Int = 12_000,
-        readTimeoutMs: Int = 18_000,
+        connectTimeoutMs: Int = 8_000,
+        readTimeoutMs: Int = 14_000,
     ): String = withContext(Dispatchers.IO) {
-        val bytes = requestBytes(url, headers, connectTimeoutMs, readTimeoutMs)
-        decode(bytes, headers["Accept-Charset"])
+        val raw = requestRaw(url, headers, connectTimeoutMs, readTimeoutMs)
+        decode(raw.bytes, headers["Accept-Charset"])
+    }
+
+    /**
+     * 带条件请求的文本 GET：第一次全量下载，之后带 `If-None-Match` /
+     * `If-Modified-Since`，服务器回 304 时直接复用本机缓存正文。
+     *
+     * 信息流是十几个 RSS 源，能命中 304 的源不用再传 60–160 KB。
+     */
+    suspend fun getTextCached(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        cacheKey: String,
+        connectTimeoutMs: Int = 8_000,
+        readTimeoutMs: Int = 14_000,
+    ): String = withContext(Dispatchers.IO) {
+        val cached = HttpCache.get(cacheKey)
+        val requestHeaders = if (cached == null) headers else headers.toMutableMap().apply {
+            cached.etag?.let { put("If-None-Match", it) }
+            cached.lastModified?.let { put("If-Modified-Since", it) }
+        }
+        val raw = requestRaw(url, requestHeaders, connectTimeoutMs, readTimeoutMs)
+        if (raw.status == 304) {
+            return@withContext cached?.body
+                ?: throw HttpException(304, "服务端返回 304，但本机没有缓存正文")
+        }
+        val text = decode(raw.bytes, raw.headers["content-type"] ?: headers["Accept-Charset"])
+        HttpCache.put(cacheKey, text, raw.headers["etag"], raw.headers["last-modified"])
+        text
     }
 
     suspend fun getBytes(
@@ -35,7 +74,7 @@ object Http {
         connectTimeoutMs: Int = 15_000,
         readTimeoutMs: Int = 30_000,
     ): ByteArray = withContext(Dispatchers.IO) {
-        requestBytes(url, headers, connectTimeoutMs, readTimeoutMs)
+        requestRaw(url, headers, connectTimeoutMs, readTimeoutMs).bytes
     }
 
     suspend fun postJson(
@@ -74,12 +113,12 @@ object Http {
         }
     }
 
-    private fun requestBytes(
+    private fun requestRaw(
         url: String,
         headers: Map<String, String>,
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
-    ): ByteArray {
+    ): HttpRaw {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = connectTimeoutMs
@@ -89,21 +128,38 @@ object Http {
             setRequestProperty("Accept", "application/json, application/xml, text/xml, text/html, */*")
             setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.7")
             setRequestProperty("Accept-Encoding", "gzip")
-            setRequestProperty("Connection", "close")
+            // 默认的 keep-alive 会把同一个域名的 TLS 连接复用起来，
+            // 十几个来源连续刷新时能省掉大半的连接建立时间。
             headers.forEach { (k, v) -> setRequestProperty(k, v) }
         }
+        var keepAlive = false
         try {
             val code = conn.responseCode
+            val responseHeaders = conn.headerFields.orEmpty()
+                .mapNotNull { (name, values) ->
+                    name?.lowercase()?.let { it to values.firstOrNull().orEmpty() }
+                }
+                .toMap()
+
+            if (code == 304) {
+                keepAlive = true
+                return HttpRaw(code, ByteArray(0), responseHeaders)
+            }
             if (code !in 200..299) {
-                val text = runCatching { conn.errorStream?.readBytes()?.toString(Charsets.UTF_8) }.getOrNull()
+                val text = runCatching {
+                    conn.errorStream?.use { it.readBytes() }?.toString(Charsets.UTF_8)
+                }.getOrNull()
                 throw HttpException(code, errorMessage(code, text.orEmpty()))
             }
             val input = if (conn.contentEncoding?.contains("gzip", true) == true) {
                 GZIPInputStream(conn.inputStream)
             } else conn.inputStream
-            return input.use { it.readBytes() }
+            val bytes = input.use { it.readBytes() }
+            keepAlive = true
+            return HttpRaw(code, bytes, responseHeaders)
         } finally {
-            conn.disconnect()
+            // 成功读完就把连接还给连接池；出错时主动断开，避免半截连接占着池子。
+            if (!keepAlive) runCatching { conn.disconnect() }
         }
     }
 
@@ -128,6 +184,30 @@ object Http {
             else -> "网络请求失败（$code）${if (detail.isNotBlank()) "：$detail" else ""}"
         }
     }
+}
+
+/** 条件请求命中的缓存正文。 */
+data class HttpCacheEntry(
+    val body: String,
+    val etag: String?,
+    val lastModified: String?,
+    val storedAt: Long,
+)
+
+/** 条件请求用的轻量正文缓存；按 URL/插件 id 分开，最多留 48 份。 */
+object HttpCache {
+
+    private const val MAX_ENTRIES = 48
+    private val entries = ConcurrentHashMap<String, HttpCacheEntry>()
+
+    fun get(key: String): HttpCacheEntry? = entries[key]
+
+    fun put(key: String, body: String, etag: String?, lastModified: String?) {
+        if (entries.size >= MAX_ENTRIES && !entries.containsKey(key)) entries.clear()
+        entries[key] = HttpCacheEntry(body, etag, lastModified, System.currentTimeMillis())
+    }
+
+    fun clear() = entries.clear()
 }
 
 fun ByteArray.toUtf8(): String = toString(Charsets.UTF_8)

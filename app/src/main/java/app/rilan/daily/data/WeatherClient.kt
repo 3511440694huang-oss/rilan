@@ -6,6 +6,7 @@ import app.rilan.daily.core.CityResult
 import app.rilan.daily.core.DailyWeather
 import app.rilan.daily.core.HourlyWeather
 import app.rilan.daily.core.WeatherData
+import app.rilan.daily.core.WeatherNow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,6 +25,7 @@ import java.time.ZoneOffset
 import java.time.ZonedDateTime
 import java.time.format.DateTimeParseException
 import java.util.Locale
+import kotlin.math.abs
 import java.util.concurrent.CancellationException
 
 /**
@@ -45,17 +47,70 @@ class WeatherClient {
      */
     private val optionalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** 空气质量是小时级数据，30 分钟内复用，避免每轮全量天气都多打一次接口。 */
+    @Volatile private var cachedAir: AirQuality? = null
+    @Volatile private var cachedAirAt = 0L
+    @Volatile private var cachedAirLat = Double.NaN
+    @Volatile private var cachedAirLon = Double.NaN
+
     suspend fun fetch(settings: AppSettings): WeatherData = withContext(Dispatchers.IO) {
-        val airJob = optionalScope.async { runCatching { fetchAir(settings) }.getOrNull() }
+        val now = System.currentTimeMillis()
+        val reusableAir = cachedAir?.takeIf {
+            now - cachedAirAt < AIR_CACHE_TTL_MS &&
+                abs(cachedAirLat - settings.latitude) < 1e-4 &&
+                abs(cachedAirLon - settings.longitude) < 1e-4
+        }
+        val airJob = if (reusableAir == null) {
+            optionalScope.async { runCatching { fetchAir(settings) }.getOrNull() }
+        } else {
+            null
+        }
         try {
             val data = fetchForecast(settings)
-            val air = withTimeoutOrNull(AIR_WAIT_MS) { airJob.await() }
-            if (air == null) airJob.cancel()
+            val air = reusableAir ?: withTimeoutOrNull(AIR_WAIT_MS) { airJob?.await() }
+            if (airJob != null) {
+                if (air == null) {
+                    airJob.cancel()
+                } else {
+                    cachedAir = air
+                    cachedAirAt = System.currentTimeMillis()
+                    cachedAirLat = settings.latitude
+                    cachedAirLon = settings.longitude
+                }
+            }
             if (air != null) data.copy(air = air) else data
         } catch (t: Throwable) {
-            airJob.cancel()
+            airJob?.cancel()
             throw t
         }
+    }
+
+    /**
+     * 轻量实时轮询：只取 `current` 字段，响应只有几百字节。
+     *
+     * 全量预报（逐小时 / 7 天 / 空气质量）仍然走 [fetch]，由仓库每 10 分钟拉一次；
+     * 这个接口只负责让卡片上的温度、体感、风、天气现象尽快跟上最新值。
+     */
+    suspend fun fetchCurrent(settings: AppSettings): WeatherNow? = withContext(Dispatchers.IO) {
+        val root = json(
+            currentUrl(settings),
+            "获取实时天气失败",
+            connectTimeoutMs = FAST_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = FAST_READ_TIMEOUT_MS,
+        )
+        val current = root.optJSONObject("current") ?: return@withContext null
+        val temp = current.optDouble("temperature_2m", Double.NaN)
+        if (temp.isNaN()) return@withContext null
+        WeatherNow(
+            temp = temp,
+            feelsLike = current.optDouble("apparent_temperature", temp),
+            humidity = current.optInt("relative_humidity_2m", 0),
+            windSpeed = current.optDouble("wind_speed_10m", 0.0),
+            windDirection = current.optInt("wind_direction_10m", 0),
+            weatherCode = current.optInt("weather_code", UNKNOWN_CODE),
+            isDay = current.optInt("is_day", 1) != 0,
+            fetchedAt = System.currentTimeMillis(),
+        )
     }
 
     private suspend fun fetchForecast(settings: AppSettings): WeatherData {
@@ -349,6 +404,17 @@ class WeatherClient {
 
     // ── URL ─────────────────────────────────────────────────────────────────
 
+    /** 只是 current 的极简请求；毫秒桶做 cache buster，避免拿到中间层缓存。 */
+    private fun currentUrl(settings: AppSettings): String = buildString {
+        append("https://api.open-meteo.com/v1/forecast")
+        append("?latitude=").append(coord(settings.latitude))
+        append("&longitude=").append(coord(settings.longitude))
+        append("&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,")
+        append("precipitation,weather_code,wind_speed_10m,wind_direction_10m")
+        append("&timezone=auto&forecast_days=1")
+        append("&_=").append(System.currentTimeMillis() / 15_000L)
+    }
+
     private fun forecastUrl(settings: AppSettings): String = buildString {
         append("https://api.open-meteo.com/v1/forecast")
         append("?latitude=").append(coord(settings.latitude))
@@ -378,13 +444,20 @@ class WeatherClient {
         const val MISSING_INT = Int.MIN_VALUE
         const val DEFAULT_TIMEZONE = "Asia/Shanghai"
 
-        /** 移动网络下 6.5 秒连不上基本可以判定为弱网，不再死等。 */
-        const val CONNECT_TIMEOUT_MS = 6_500
-        const val READ_TIMEOUT_MS = 11_000
+        /** 移动网络下 4.5 秒连不上基本可以判定为弱网，不再死等；失败重试一次。 */
+        const val CONNECT_TIMEOUT_MS = 4_500
+        const val READ_TIMEOUT_MS = 9_000
+
+        /** 轻量实时轮询：弱网也别拖住下一次，超时更短、不阻塞。 */
+        const val FAST_CONNECT_TIMEOUT_MS = 3_000
+        const val FAST_READ_TIMEOUT_MS = 5_000
         const val REQUEST_RETRIES = 1
         const val RETRY_DELAY_MS = 350L
 
         /** 主天气到手后，最多再等空气质量这么久，等不到就放弃这块可选数据。 */
         const val AIR_WAIT_MS = 2_200L
+
+        /** CAMS 空气质量是小时级，30 分钟复用一次足够。 */
+        const val AIR_CACHE_TTL_MS = 30 * 60_000L
     }
 }
