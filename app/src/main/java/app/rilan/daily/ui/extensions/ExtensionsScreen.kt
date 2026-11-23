@@ -9,7 +9,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -20,6 +22,9 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -90,6 +95,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.AiTestState
@@ -108,6 +114,7 @@ import app.rilan.daily.ui.components.GlassIconButton
 import app.rilan.daily.ui.components.LoadingDots
 import app.rilan.daily.ui.components.ScreenTitle
 import app.rilan.daily.ui.components.SectionLabel
+import app.rilan.daily.ui.components.swipeSections
 import app.rilan.daily.ui.components.TextAction
 import app.rilan.daily.ui.theme.RilanColors
 import kotlinx.coroutines.delay
@@ -120,16 +127,14 @@ private data class PluginEditorRequest(
 )
 
 /**
- * 扩展页的四个分段。
+ * 扩展页的三个分段。
  *
- * 早先所有内容纵向堆在一页里，一进来就看到来源、热榜、MCP、令牌、目录，
- * 信息量太大。现在按「用的时候才看」拆开：来源、服务、AI、更多各一格，
- * 每组默认只露一行摘要，点开才展开细节。
+ * 1.7.5 起「服务」（MCP）和「AI」（DeepSeek 直连）合并为「连接」一段：
+ * 两者都是"把日览接到外部能力"，放在一格更连贯，也少一次左右滑。
  */
 enum class ExtensionsSection(val label: String) {
     SOURCES("来源"),
-    SERVICE("服务"),
-    AI("AI"),
+    CONNECT("连接"),
     MORE("更多"),
 }
 
@@ -160,6 +165,8 @@ fun ExtensionsScreen(
     initialSection: ExtensionsSection = ExtensionsSection.SOURCES,
     notificationsGranted: Boolean = false,
     onRequestNotifications: (() -> Unit)? = null,
+    // 底部悬浮导航让出的高度，写进滚动内容末尾，避免外层 padding 截断视口。
+    bottomInset: Dp = 0.dp,
 ) {
     val context = LocalContext.current
     var sectionName by rememberSaveable { mutableStateOf(initialSection.name) }
@@ -205,15 +212,27 @@ fun ExtensionsScreen(
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding(),
-        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 24.dp),
+            .statusBarsPadding()
+            // 左右滑切换「来源 / 连接 / 更多」三个分段。
+            .swipeSections(enabled = editor == null && pendingDelete == null) { direction ->
+                val index = ExtensionsSection.entries.indexOf(section)
+                val next = (index + direction + ExtensionsSection.entries.size) % ExtensionsSection.entries.size
+                sectionName = ExtensionsSection.entries[next].name
+            },
+        // 底部留白写进滚动内容：内容铺满屏滚动，最后一条停在导航胶囊之上。
+        contentPadding = PaddingValues(
+            start = 18.dp,
+            end = 18.dp,
+            top = 8.dp,
+            bottom = 24.dp + bottomInset,
+        ),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item {
             ScreenTitle(
                 eyebrow = "扩展",
                 title = "信息与连接",
-                subtitle = "来源、MCP 与 DeepSeek 各占一格，点开再动细节",
+                subtitle = "来源、连接与更多各占一格，点开再动细节",
                 actions = {
                     GlassIconButton(
                         icon = Icons.Filled.Add,
@@ -230,8 +249,24 @@ fun ExtensionsScreen(
         }
 
         item {
-            when (section) {
-                ExtensionsSection.SOURCES -> SourcesTab(
+            AnimatedContent(
+                targetState = section,
+                transitionSpec = {
+                    val forward = targetState.ordinal >= initialState.ordinal
+                    val enter = slideInHorizontally(
+                        animationSpec = tween(220, easing = FastOutSlowInEasing),
+                        initialOffsetX = { full -> if (forward) full / 10 else -full / 10 },
+                    ) + fadeIn(animationSpec = tween(180))
+                    val exit = slideOutHorizontally(
+                        animationSpec = tween(180, easing = FastOutSlowInEasing),
+                        targetOffsetX = { full -> if (forward) -full / 10 else full / 10 },
+                    ) + fadeOut(animationSpec = tween(140))
+                    enter togetherWith exit
+                },
+                label = "extensionSection",
+            ) { currentSection ->
+                when (currentSection) {
+                    ExtensionsSection.SOURCES -> SourcesTab(
                     plugins = plugins,
                     pluginErrors = pluginErrors,
                     weibo = weiboHotEnabled,
@@ -246,9 +281,12 @@ fun ExtensionsScreen(
                     onTogglePlugin = onTogglePlugin,
                 )
 
-                ExtensionsSection.SERVICE -> ServiceTab(
+                // 服务 + AI 合并成「连接」一格：MCP 和 DeepSeek 都是"接外部能力"。
+                ExtensionsSection.CONNECT -> ConnectTab(
                     state = mcpState,
                     test = mcpTest,
+                    settings = settings,
+                    aiTest = aiTest,
                     onCopyEndpoint = { copyText(context, mcpState.endpoint, "端点已复制") },
                     onCopyToken = { copyText(context, mcpState.token, "令牌已复制") },
                     onCopyDsh = {
@@ -268,14 +306,8 @@ fun ExtensionsScreen(
                     onStart = onStartMcp,
                     onStop = onStopMcp,
                     onTest = onTestMcp,
-                )
-
-                ExtensionsSection.AI -> AiTab(
-                    settings = settings,
-                    aiTest = aiTest,
                     onSaveSettings = onSaveSettings,
                     onTestDeepSeek = onTestDeepSeek,
-                    onOpenService = { sectionName = ExtensionsSection.SERVICE.name },
                 )
 
                 ExtensionsSection.MORE -> MoreTab(
@@ -287,6 +319,7 @@ fun ExtensionsScreen(
                     notificationsGranted = notificationsGranted,
                     onRequestNotifications = onRequestNotifications,
                 )
+                }
             }
         }
     }
@@ -383,10 +416,10 @@ private fun SectionTabs(
 }
 
 private fun sectionAccent(section: ExtensionsSection): Color = when (section) {
-    ExtensionsSection.SOURCES -> RilanColors.Blue
-    ExtensionsSection.SERVICE -> RilanColors.Gold
-    ExtensionsSection.AI -> RilanColors.Dawn
-    ExtensionsSection.MORE -> RilanColors.Moon
+    // 三段统一用主题冷色系：天蓝 → 淡紫 → 薄荷，彼此区分又同属一套调色板。
+    ExtensionsSection.SOURCES -> RilanColors.Sky
+    ExtensionsSection.CONNECT -> RilanColors.Lilac
+    ExtensionsSection.MORE -> RilanColors.Jade
 }
 
 /** 分组摘要行：默认只露这一行，点一下展开细节。 */
@@ -737,6 +770,61 @@ private fun HotSwitchRow(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 连接：MCP 服务 + DeepSeek 直连合并显示
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ConnectTab(
+    state: McpServerState,
+    test: McpTestState,
+    settings: AppSettings,
+    aiTest: AiTestState,
+    onCopyEndpoint: () -> Unit,
+    onCopyToken: () -> Unit,
+    onCopyDsh: () -> Unit,
+    onCopyJson: () -> Unit,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    onTest: () -> Unit,
+    onSaveSettings: ((AppSettings) -> Unit)?,
+    onTestDeepSeek: ((String, String) -> Unit)?,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        GlassCard(
+            Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                SectionLabel("本机的两种连接方式", RilanColors.Moon)
+                Text(
+                    "MCP 让 DSH 等外部 AI 读写日报；DeepSeek 直连在首页直接生成总览。两者互不影响，可只用其中一个。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = RilanColors.TextSecondary,
+                )
+            }
+        }
+        ServiceTab(
+            state = state,
+            test = test,
+            onCopyEndpoint = onCopyEndpoint,
+            onCopyToken = onCopyToken,
+            onCopyDsh = onCopyDsh,
+            onCopyJson = onCopyJson,
+            onStart = onStart,
+            onStop = onStop,
+            onTest = onTest,
+        )
+        AiTab(
+            settings = settings,
+            aiTest = aiTest,
+            onSaveSettings = onSaveSettings,
+            onTestDeepSeek = onTestDeepSeek,
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 服务：MCP 默认只露一行状态
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -963,7 +1051,6 @@ private fun AiTab(
     aiTest: AiTestState,
     onSaveSettings: ((AppSettings) -> Unit)?,
     onTestDeepSeek: ((String, String) -> Unit)?,
-    onOpenService: () -> Unit,
 ) {
     val context = LocalContext.current
     val configured = settings.deepseekConfigured
@@ -1137,21 +1224,7 @@ private fun AiTab(
             }
         }
 
-        GlassCard(
-            Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(22.dp),
-            contentPadding = PaddingValues(16.dp),
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                SectionLabel("MCP 是另一条路", RilanColors.Gold)
-                Text(
-                    "MCP 让 DSH 等外部 AI 读取日报、写解读、操作日程；和 DeepSeek 直连互不影响，可以只开一个。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = RilanColors.TextSecondary,
-                )
-                TextAction("去服务页 →", onOpenService, color = RilanColors.Gold)
-            }
-        }
+        // 「MCP 与直连」的说明卡在合并版里由 ConnectTab 顶部统一给出，这里不再重复。
     }
 
     if (confirmClear) {
@@ -1312,6 +1385,8 @@ private fun MoreTab(
             }
         }
 
+        AboutCard()
+
         GlassCard(
             Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(22.dp),
@@ -1355,6 +1430,72 @@ private fun MoreTab(
                 }
             }
         }
+    }
+}
+
+/** 关于：项目主页与作者主页，点了直接用浏览器打开。 */
+@Composable
+private fun AboutCard() {
+    val context = LocalContext.current
+    GlassCard(
+        Modifier.fillMaxWidth(),
+        strong = true,
+        shape = RoundedCornerShape(22.dp),
+        contentPadding = PaddingValues(16.dp),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionLabel("关于", RilanColors.Mint)
+            Text(
+                "日览 · Rilan — 本地优先的每日简报，随手收录、周期回望。",
+                style = MaterialTheme.typography.bodySmall,
+                color = RilanColors.TextSecondary,
+            )
+            AboutLink(title = "GitHub · 源码与发布", subtitle = "3511440694huang-oss/rilan") {
+                openLink(context, "https://github.com/3511440694huang-oss/rilan")
+            }
+            AboutLink(
+                title = "哔哩哔哩 · 银吟月的个人空间",
+                subtitle = "b23.tv/y5m1C5s",
+            ) {
+                openLink(context, "https://b23.tv/y5m1C5s")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AboutLink(
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0x14FFFFFF))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.labelLarge, color = RilanColors.Text)
+            Text(subtitle, style = MaterialTheme.typography.labelSmall, color = RilanColors.TextTertiary)
+        }
+        Text("↗", style = MaterialTheme.typography.titleMedium, color = RilanColors.Mint)
+    }
+}
+
+private fun openLink(context: Context, url: String) {
+    runCatching {
+        context.startActivity(
+            android.content.Intent(
+                android.content.Intent.ACTION_VIEW,
+                android.net.Uri.parse(url),
+            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.onFailure {
+        Toast.makeText(context, "打不开链接，请检查浏览器", Toast.LENGTH_SHORT).show()
     }
 }
 

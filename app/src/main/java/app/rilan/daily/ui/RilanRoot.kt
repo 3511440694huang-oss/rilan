@@ -128,7 +128,7 @@ fun RilanRoot(vm: MainViewModel) {
 
     var tabName by rememberSaveable { mutableStateOf(MainTab.HOME.name) }
     val tab = runCatching { MainTab.valueOf(tabName) }.getOrDefault(MainTab.HOME)
-    // 首页 / 设置页 / 回望页跳扩展页时，指定落点（来源 / 服务 / AI / 更多）。
+    // 首页 / 设置页 / 回望页跳扩展页时，指定落点（来源 / 连接 / 更多）。
     var extensionsStart by rememberSaveable { mutableStateOf(ExtensionsSection.SOURCES) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
     var notificationsGranted by remember { mutableStateOf(vm.notificationsEnabled()) }
@@ -264,7 +264,7 @@ fun RilanRoot(vm: MainViewModel) {
                         }
                     },
                     onOpenExtensions = {
-                        extensionsStart = ExtensionsSection.AI
+                        extensionsStart = ExtensionsSection.CONNECT
                         settingsOpen = false
                         tabName = MainTab.EXTENSIONS.name
                     },
@@ -308,9 +308,9 @@ fun RilanRoot(vm: MainViewModel) {
                                 onRefresh = vm::refreshAll,
                                 onOpenSettings = { settingsOpen = true },
                                 onItemClick = { item -> openUrl(context, item.url) },
-                                // 「去设置连接 DeepSeek」直接落在扩展页的 AI 分段，不用再自己找。
+                                // 「去设置连接 DeepSeek」直接落在扩展页的连接分段，不用再自己找。
                                 onOpenAiSettings = {
-                                    extensionsStart = ExtensionsSection.AI
+                                    extensionsStart = ExtensionsSection.CONNECT
                                     settingsOpen = false
                                     tabName = MainTab.EXTENSIONS.name
                                 },
@@ -332,9 +332,10 @@ fun RilanRoot(vm: MainViewModel) {
                                 onDelete = vm::deleteSchedule,
                                 onToggleDone = vm::toggleScheduleDone,
                                 onRequestNotification = ::requestNotifications,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(bottom = dockInset),
+                                // 底部留白交给页面自身的滚动内容：外层 padding 会缩小整个视口，
+                                // 内容在导航上方提前结束，看起来就像被导航栏「截断」。
+                                bottomInset = dockInset,
+                                modifier = Modifier.fillMaxSize(),
                             )
                             MainTab.REVIEW -> ReviewScreen(
                                 records = records,
@@ -342,16 +343,15 @@ fun RilanRoot(vm: MainViewModel) {
                                 loading = summaryLoading,
                                 aiConfigured = mcpState.running,
                                 onGenerate = {
-                                    extensionsStart = ExtensionsSection.SERVICE
+                                    extensionsStart = ExtensionsSection.CONNECT
                                     tabName = MainTab.EXTENSIONS.name
                                 },
                                 onOpenSettings = {
-                                    extensionsStart = ExtensionsSection.AI
+                                    extensionsStart = ExtensionsSection.CONNECT
                                     tabName = MainTab.EXTENSIONS.name
                                 },
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(bottom = dockInset),
+                                modifier = Modifier.fillMaxSize(),
+                                bottomInset = dockInset,
                                 deepseekConfigured = settingsUi.settings.deepseekConfigured,
                                 summaryMode = settingsUi.settings.summaryMode,
                                 onModeChange = vm::setSummaryMode,
@@ -389,8 +389,7 @@ fun RilanRoot(vm: MainViewModel) {
                                 notificationsGranted = notificationsGranted,
                                 onRequestNotifications = ::requestNotifications,
                                 modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(bottom = dockInset),
+                                    .fillMaxSize(),
                             )
                         }
                     }

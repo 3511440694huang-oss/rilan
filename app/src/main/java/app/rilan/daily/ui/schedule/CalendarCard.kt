@@ -13,6 +13,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -57,7 +58,6 @@ import app.rilan.daily.ui.components.GlassIconButton
 import app.rilan.daily.ui.theme.RilanColors
 import java.time.LocalDate
 import java.time.YearMonth
-import kotlin.math.abs
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 月历卡：周一开头的 6×7 网格。
@@ -156,44 +156,32 @@ private fun SwipeableMonthGrid(
         Modifier
             .fillMaxWidth()
             .pointerInput(Unit) {
-                // 只在「横向占优」时接管这一串手势：拇指斜着上下滑的时候，
-                // 竖直位移必须完整留给外层 LazyColumn，否则月历这块最占面积的触摸区
-                // 会把整页的竖滑吃掉，表现就是滑不动。
-                // 阈值也用 dp，别写裸像素——同一条手势在 3x 屏上不该只走 24dp 就翻月。
-                val slop = viewConfiguration.touchSlop
-                val monthStep = 72.dp.toPx()
+                // 跨机型手势仲裁：用框架的方向锁原语代替手写阈值判定。
+                // awaitHorizontalTouchSlopOrCancellation 用系统 touchSlop 锁定方向，
+                // 横向未占优时返回 null 并把整串位移让给父 LazyColumn——斜着上下滑
+                // 不会再「一边翻月一边滚列表」；不同机型 density / ROM touchSlop
+                // 差异也由框架统一处理，不再出现某些机型滑不动。
                 awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val down = awaitFirstDown()
+                    // 多指（缩放 / 系统手势）介入时直接放弃本次手势，不消费任何位移。
+                    if (awaitPointerEvent().changes.count { it.pressed } > 1) return@awaitEachGesture
                     var totalX = 0f
-                    var totalY = 0f
-                    var claimed = false
-                    var released = false
+                    val drag = awaitHorizontalTouchSlopOrCancellation(down.id) { change, over ->
+                        change.consume() // 只有在横向锁定后才消费，纵向一律留给父容器
+                        totalX += over
+                    }
+                    if (drag == null) return@awaitEachGesture
                     while (true) {
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull { it.id == down.id } ?: break
                         totalX += change.positionChange().x
-                        totalY += change.positionChange().y
-                        if (!claimed) {
-                            if (abs(totalX) > slop && abs(totalX) > abs(totalY)) {
-                                claimed = true
-                            } else if (abs(totalY) > slop) {
-                                // 竖直手势：不消费、直接放弃，让外层列表继续滚
-                                break
-                            }
-                        }
-                        if (claimed) change.consume()
-                        if (!change.pressed) {
-                            released = true
-                            break
-                        }
+                        change.consume()
+                        if (!change.pressed) break
                     }
-                    if (claimed && released) {
-                        if (totalX <= -monthStep) {
-                            changeMonth(currentMonth.plusMonths(1))
-                        } else if (totalX >= monthStep) {
-                            changeMonth(currentMonth.minusMonths(1))
-                        }
-                    }
+                    // 翻月阈值按网格宽度取比例，小屏 / 平板所需距离一致。
+                    val step = size.width * 0.22f
+                    if (totalX <= -step) changeMonth(currentMonth.plusMonths(1))
+                    else if (totalX >= step) changeMonth(currentMonth.minusMonths(1))
                 }
             },
     ) {

@@ -305,7 +305,7 @@ private fun HeroWeatherGlyph(
 private fun WeatherBody(weather: WeatherData) {
     val accent = weatherTint(weather)
     Column(verticalArrangement = Arrangement.spacedBy(13.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Row(verticalAlignment = Alignment.Bottom) {
                 Text(
                     weather.currentTemp.roundToInt().toString(),
@@ -323,10 +323,15 @@ private fun WeatherBody(weather: WeatherData) {
                         .padding(start = 2.dp),
                 )
             }
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.width(16.dp))
             Column(
-                horizontalAlignment = Alignment.End,
-                modifier = Modifier.padding(bottom = 7.dp),
+                Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.White.copy(alpha = 0.04f))
+                    .border(0.65.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Text(
                     weather.condition,
@@ -334,16 +339,15 @@ private fun WeatherBody(weather: WeatherData) {
                     color = RilanColors.Text,
                     maxLines = 1,
                 )
-                Spacer(Modifier.height(4.dp))
                 Text(
-                    "最高 ${weather.high.roundToInt()}°  最低 ${weather.low.roundToInt()}°",
+                    "最高 ${weather.high.roundToInt()}°   最低 ${weather.low.roundToInt()}°",
                     style = MaterialTheme.typography.bodySmall,
                     color = RilanColors.TextSecondary,
                     maxLines = 1,
                 )
                 Text(
                     "体感 ${weather.feelsLike.roundToInt()}°",
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.labelSmall,
                     color = RilanColors.TextTertiary,
                     maxLines = 1,
                 )
@@ -410,10 +414,10 @@ private fun HourlyStrip(weather: WeatherData, accent: Color) {
                 letterSpacing = 0.4.sp,
             )
             Spacer(Modifier.weight(1f))
-            Text(
-                "降水 ${weather.precipProb}%",
-                style = MaterialTheme.typography.labelSmall,
-                color = accent.copy(alpha = 0.9f),
+            GlassPill(
+                text = "降水 ${weather.precipProb}%",
+                color = accent.copy(alpha = 0.95f),
+                background = accent.copy(alpha = 0.10f),
             )
         }
         Row(

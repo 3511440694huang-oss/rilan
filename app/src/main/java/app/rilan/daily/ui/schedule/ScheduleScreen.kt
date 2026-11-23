@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.EventKind
@@ -71,7 +72,7 @@ import java.time.temporal.ChronoUnit
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 日程页：标题 + 通知提示 + 月历 + 选中日清单 + 接下来 + 本月统计。
-// 不含背景与底部导航，由外层宿主提供；底部留 100dp 给悬浮导航。
+// 不含背景与底部导航，由外层宿主提供；底部留白由 bottomInset 写进滚动内容。
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -85,6 +86,7 @@ fun ScheduleScreen(
     onToggleDone: (String, String) -> Unit,
     onRequestNotification: () -> Unit,
     modifier: Modifier = Modifier,
+    bottomInset: Dp = 0.dp,
 ) {
     val today = remember { LocalDate.now() }
     var selectedDate by remember { mutableStateOf(today) }
@@ -111,7 +113,13 @@ fun ScheduleScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding(),
-            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 4.dp, bottom = 24.dp),
+            // 底部留白写进滚动内容，内容铺满整屏滚动、最后一条停在导航胶囊之上。
+            contentPadding = PaddingValues(
+                start = 18.dp,
+                end = 18.dp,
+                top = 4.dp,
+                bottom = 24.dp + bottomInset,
+            ),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             item {

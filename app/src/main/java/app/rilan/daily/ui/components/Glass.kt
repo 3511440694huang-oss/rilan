@@ -90,9 +90,11 @@ fun AppBackdrop(
     content: @Composable BoxScope.() -> Unit,
 ) {
     var photo by remember { mutableStateOf<ImageBitmap?>(null) }
-    // 按屏幕长边解码：必应原图动辄 4K，全量解码既占内存又让首帧更慢。
+    // 按屏幕短边解码，并限制解码总像素：横屏 4K 壁纸全量解码极易 OOM，
+    // 旧版按长边解码在 Crossfade 期间两张位图叠加接近 46MB，低内存机型会闪退、
+    // 滚动时大位图合成也会卡顿。短边尺寸已够铺满竖屏（上面还压着两层 scrim）。
     val metrics = LocalContext.current.resources.displayMetrics
-    val targetEdge = maxOf(metrics.widthPixels, metrics.heightPixels)
+    val targetEdge = minOf(metrics.widthPixels, metrics.heightPixels)
 
     LaunchedEffect(wallpaper?.path, targetEdge) {
         val path = wallpaper?.path
@@ -237,14 +239,9 @@ fun GlassCard(
     Box(
         modifier
             .graphicsLayer { scaleX = scale; scaleY = scale }
-            .shadow(
-                // 阴影固定：静止和翻页时是同一块玻璃，不会在松手那一刻突然变样。
-                elevation = if (strong) 28.dp else 18.dp,
-                shape = shape,
-                clip = false,
-                ambientColor = Color.Black,
-                spotColor = Color(0xFF24345C),
-            )
+            // 不用 Modifier.shadow：黑色投影叠在深色玻璃上就是用户看到的
+            // 「半透明黑矩形」，每张卡都有、非常显眼。玻璃的厚度和轮廓
+            // 由下面 drawWithCache 里的顶/侧双层细边 + 顶部高光表达，足够立体。
             .clip(shape)
             .then(
                 if (onClick != null) {
@@ -305,10 +302,12 @@ fun GlassCard(
                             start = Offset(sheenX, 0f),
                             end = Offset(sheenX + w * 0.46f, h),
                         )
-                        // 底部内阴影，玻璃才有厚度。
+                        // 底部内阴影：玻璃才有厚度。
+                        // 只用极淡的一层，且画在离底部很窄的区间——旧版 0.64 起铺到 1f、
+                        // 18% 纯黑，用户看到的是每张卡底部一整块半透明黑矩形，很突兀。
                         val innerShadow = Brush.verticalGradient(
-                            0.64f to Color.Transparent,
-                            1f to Color.Black.copy(alpha = 0.18f),
+                            0.93f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.06f),
                         )
                         val topLine = Brush.horizontalGradient(
                             listOf(

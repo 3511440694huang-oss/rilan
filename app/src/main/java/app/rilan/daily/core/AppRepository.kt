@@ -23,11 +23,13 @@ import app.rilan.daily.schedule.Recurrence
 import app.rilan.daily.schedule.ReminderScheduler
 import app.rilan.daily.schedule.ScheduleStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,7 +56,18 @@ class AppRepository(context: Context) : McpHost {
 
     private val appContext = context.applicationContext
     private val prefs = Prefs(appContext)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * 兜底：任何漏网的协程异常（含 unawaited async 的失败、可空返回分支里的断言失败）
+     * 都在这里被吞掉并记流量日志，绝不再冒到默认 uncaught handler 触发闪退。
+     * 天气/内容这类网络失败本身在各自 launch 里已经就地转成 UI 错误态，走到这里只可能是
+     * 极端边界，静默处理比把整个 App 杀掉更符合「本地优先、弱网可用」的定位。
+     */
+    private val coroutineErrors = CoroutineExceptionHandler { _, t ->
+        runCatching {
+            CrashLog.note(appContext, "后台任务异常", t)
+        }
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + coroutineErrors)
 
     private val initialSettings = ensureMcpToken(prefs.loadSettings())
 
@@ -279,7 +292,7 @@ class AppRepository(context: Context) : McpHost {
             // 全量刷新会整体替换天气对象，先停掉可能回来的轻量轮询，避免旧值覆盖新值。
             fastWeatherJob?.cancel()
             beginRefresh()
-            var early: Deferred<WeatherData>? = null
+            var early: Deferred<Result<WeatherData>>? = null
             try {
                 val settings = _settings.value
                 val auto = settings.autoLocation
@@ -300,7 +313,10 @@ class AppRepository(context: Context) : McpHost {
                 // 先用上次坐标（或手动城市）立刻拉天气；定位与区县反查在下面并行补，
                 // 位置服务慢时不再把天气卡在 loading 里十几秒。
                 if (!auto || settings.lastLocationAt > 0L) {
-                    early = async { weatherClient.fetch(settings) }
+                    // 把结果包成 Result：即使定位分支最终不 await，这个 async 也永远
+                    // 不会以异常结束，也就不会把失败冒泡到 scope 当成未捕获异常。
+                    // 用户报过的 connection closed 闪退就是这条路径。
+                    early = async { runCatching { weatherClient.fetch(settings) } }
                 }
 
                 var place: PlaceInfo? = null
@@ -355,9 +371,13 @@ class AppRepository(context: Context) : McpHost {
                         // 位置变了，旧坐标的天气作废，换新坐标再拉一次
                         pending.cancel()
                     } else {
-                        data = pending.await()
+                        // 用 runCatching 解包：deferred 若已被取消不应把 CancellationException
+                        // 一路抛到 scope（那会被当未捕获异常），当成「没有预取到」走下面的重拉即可。
+                        data = pending.await().getOrNull()
                     }
                 }
+                // 预取失败（Result 里是 error）时再同步拉一次，让错误落到下面的 catch(Throwable)
+                // 转成界面错误态；这里绝不让异常沉到协程顶层变成闪退。
                 val fresh = data ?: weatherClient.fetch(_settings.value)
                 prefs.saveWeatherCache(fresh)
                 _home.update {
@@ -371,7 +391,10 @@ class AppRepository(context: Context) : McpHost {
                 mutateSettings { it.copy(lastWeatherAt = System.currentTimeMillis()) }
             } catch (cancel: CancellationException) {
                 early?.cancel()
-                throw cancel
+                // 整个仓库在关闭时才上抛；子任务被主动取消（重新定位 / 切自动定位）
+                // 属正常路径，静默结束即可——旧版在这里写错误文本会和紧接着的新请求竞态，
+                // 留下「天气更新已取消」的假错误。
+                if (!scope.isActive) throw cancel
             } catch (t: Throwable) {
                 early?.cancel()
                 _home.update {
@@ -426,7 +449,9 @@ class AppRepository(context: Context) : McpHost {
                     )
                 }
             } catch (cancel: CancellationException) {
-                throw cancel
+                // 轻量轮询被取消（全量刷新顶掉、或窗口关闭）属正常，静默收尾即可。
+                // 原样上抛会在极端时序下冒到协程顶层被当成未捕获异常。
+                if (!scope.isActive) throw cancel
             } catch (t: Throwable) {
                 // 轻量轮询失败不写错误；记下失败时间做退避，别在弱网里每 20 秒锤一次。
                 lastFastWeatherAt = System.currentTimeMillis()

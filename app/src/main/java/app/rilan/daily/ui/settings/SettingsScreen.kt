@@ -116,7 +116,7 @@ fun SettingsScreen(
                         color = RilanColors.Text,
                     )
                     Text(
-                        "位置、提醒与本地数据",
+                        "设置，位置与日常偏好",
                         style = MaterialTheme.typography.bodySmall,
                         color = RilanColors.TextTertiary,
                     )
@@ -173,13 +173,19 @@ fun SettingsScreen(
                     )
 
                     if (settings.autoLocation) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SecondaryButton(text = "重新定位", onClick = onRelocate)
-                            TextAction(
-                                "改为手动",
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            SecondaryButton(
+                                text = "重新定位",
+                                onClick = onRelocate,
+                                modifier = Modifier.weight(1f),
+                            )
+                            SecondaryButton(
+                                text = "改为手动",
                                 onClick = { onAutoLocationChange(false) },
-                                color = RilanColors.TextSecondary,
-                                modifier = Modifier.padding(top = 10.dp),
+                                modifier = Modifier.weight(1f),
                             )
                         }
                     } else {
@@ -292,13 +298,13 @@ fun SettingsScreen(
             }
         }
 
-        // ── MCP ──────────────────────────────────────────────────────────────
+        // ── 连接与数据源（统一入口，不在设置里重复配置） ──────────────────────
         item {
             GlassCard(Modifier.fillMaxWidth()) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    SectionLabel("AI / MCP", RilanColors.Gold)
+                    SectionLabel("连接与数据源", RilanColors.Moon)
                     Text(
-                        "DeepSeek 负责首页的今日总览；MCP 让外部 AI 读取日报、写入解读、操作日程和来源。两条路可以单独使用，API Key 与 MCP 配置都在扩展页管理。",
+                        "AI、MCP 与信息来源统一在扩展页管理；这里只放日常偏好。",
                         style = MaterialTheme.typography.bodySmall,
                         color = RilanColors.TextSecondary,
                     )

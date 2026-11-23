@@ -4,11 +4,12 @@ import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -63,6 +64,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.rilan.daily.core.AiDigest
 import app.rilan.daily.core.Category
@@ -84,6 +86,7 @@ import app.rilan.daily.ui.components.LoadingDots
 import app.rilan.daily.ui.components.LoadingLines
 import app.rilan.daily.ui.components.ScreenTitle
 import app.rilan.daily.ui.components.SectionLabel
+import app.rilan.daily.ui.components.swipeSections
 import app.rilan.daily.ui.components.TextAction
 import app.rilan.daily.ui.theme.RilanColors
 import kotlinx.coroutines.launch
@@ -114,6 +117,8 @@ fun ReviewScreen(
     onGenerate: (SummaryPeriod) -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    // 底部悬浮导航让出的高度，写在滚动内容末尾，不占整个视口。
+    bottomInset: Dp = 0.dp,
     // 新增的 API Key 直连 / 模式切换参数都带默认值：RilanRoot 接线前后都能编译运行。
     deepseekConfigured: Boolean = false,
     summaryMode: SummaryMode = SummaryMode.MCP,
@@ -140,6 +145,14 @@ fun ReviewScreen(
             .fillMaxSize()
             .statusBarsPadding()
             .verticalScroll(rememberScrollState())
+            // 左右滑切换周期（日 / 周 / 月 / 季 / 半年 / 年），与周期 chip 的横滑共存：
+            // chip 的 horizontalScroll 会消费横向位移，本手势自动放弃。
+            .swipeSections(enabled = !showExport) { dir: Int ->
+                val periods = SummaryPeriod.entries
+                val index = periods.indexOf(selected)
+                val next = (index + dir + periods.size) % periods.size
+                selected = periods[next]
+            }
             .padding(horizontal = 20.dp),
     ) {
         Spacer(Modifier.height(6.dp))
@@ -191,12 +204,17 @@ fun ReviewScreen(
         AnimatedContent(
             targetState = selected,
             transitionSpec = {
-                (fadeIn(animationSpec = tween(240)) +
-                    slideInVertically(animationSpec = tween(260)) { it / 14 })
-                    .togetherWith(
-                        fadeOut(animationSpec = tween(150)) +
-                            slideOutVertically(animationSpec = tween(180)) { -it / 18 },
-                    )
+                // 左右滑切周期：内容跟着手势方向横向进出，动画短而顺（不抢滑动手感）。
+                val forward = targetState.ordinal >= initialState.ordinal
+                val enter = slideInHorizontally(
+                    animationSpec = tween(240, easing = FastOutSlowInEasing),
+                    initialOffsetX = { full -> if (forward) full / 8 else -full / 8 },
+                ) + fadeIn(animationSpec = tween(200))
+                val exit = slideOutHorizontally(
+                    animationSpec = tween(200, easing = FastOutSlowInEasing),
+                    targetOffsetX = { full -> if (forward) -full / 8 else full / 8 },
+                ) + fadeOut(animationSpec = tween(150))
+                enter togetherWith exit
             },
             label = "reviewPeriod",
         ) { period ->
@@ -225,7 +243,9 @@ fun ReviewScreen(
             )
         }
 
-        Spacer(Modifier.height(24.dp))
+        // 底部悬浮导航的留白放在滚动内容末尾：内容可铺满屏滚动，
+        // 最后一条仍停在胶囊之上，不会被「截断」。
+        Spacer(Modifier.height(24.dp + bottomInset))
     }
 
     if (showExport) {

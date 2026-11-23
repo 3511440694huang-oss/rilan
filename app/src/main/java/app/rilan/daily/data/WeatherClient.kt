@@ -14,6 +14,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -52,6 +53,66 @@ class WeatherClient {
     @Volatile private var cachedAirAt = 0L
     @Volatile private var cachedAirLat = Double.NaN
     @Volatile private var cachedAirLon = Double.NaN
+
+    /**
+     * 一个天气源：给定设置产出一个请求 URL，并把自有 JSON 归一化成 Open-Meteo 同形结构，
+     * 这样下面的解析逻辑（fetchForecast / fetchCurrent）完全不用改。
+     * currentUrl 为 null 表示该源不支持轻量实时轮询（只有全量预报）。
+     */
+    private data class Source(
+        val name: String,
+        val url: (AppSettings) -> String,
+        val currentUrl: (AppSettings) -> String? = { null },
+        val normalize: (JSONObject) -> JSONObject = { it },
+        val timeout: Timeout = Timeout.NORMAL,
+    )
+
+    private enum class Timeout { NORMAL, FAST }
+
+    /** 源顺序：主源 Open-Meteo → wttr.in → MET Norway，任一失败自动尝试下一个。 */
+    private val sources = listOf(
+        Source("open-meteo", ::forecastUrl, ::currentUrl),
+        Source("wttr.in", ::wttrUrl, ::wttrCurrentUrl, ::normalizeWttr, Timeout.FAST),
+        Source("met.no", ::metUrl, ::metCurrentUrl, ::normalizeMet, Timeout.FAST),
+    )
+
+    /**
+     * 依次尝试各数据源：当前源抛异常（网络 / HTTP / 解析）就换下一个；
+     * 取消（CancellationException）必须立刻向上抛，不能吞掉继续打下一个源。
+     * 全部失败时把最后一个异常交给仓库展示中文原因。
+     */
+    private suspend fun <T> trySources(block: suspend (Source) -> T): T {
+        var last: Throwable? = null
+        for (source in sources) {
+            try {
+                return block(source)
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                last = t
+            }
+        }
+        throw last ?: IOException("天气源全部失败")
+    }
+
+    private suspend fun sourceJson(source: Source, settings: AppSettings, action: String): JSONObject {
+        val fast = source.timeout == Timeout.FAST
+        // 备用源用短超时且跳过 text() 的二次重试：避免 3 源 × 2 次 × 9s 的最坏 54s 等待。
+        val body = if (fast) {
+            requestTextOnce(
+                source.url(settings), action,
+                FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS,
+            )
+        } else {
+            text(source.url(settings), action, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
+        }
+        val root = try {
+            JSONObject(body)
+        } catch (e: Exception) {
+            throw IOException("$action：返回内容无法解析", e)
+        }
+        return source.normalize(root)
+    }
 
     suspend fun fetch(settings: AppSettings): WeatherData = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
@@ -92,38 +153,52 @@ class WeatherClient {
      * 这个接口只负责让卡片上的温度、体感、风、天气现象尽快跟上最新值。
      */
     suspend fun fetchCurrent(settings: AppSettings): WeatherNow? = withContext(Dispatchers.IO) {
-        val root = json(
-            currentUrl(settings),
-            "获取实时天气失败",
-            connectTimeoutMs = FAST_CONNECT_TIMEOUT_MS,
-            readTimeoutMs = FAST_READ_TIMEOUT_MS,
-        )
-        val current = root.optJSONObject("current") ?: return@withContext null
-        val temp = current.optDouble("temperature_2m", Double.NaN)
-        if (temp.isNaN()) return@withContext null
-        WeatherNow(
-            temp = temp,
-            feelsLike = current.optDouble("apparent_temperature", temp),
-            humidity = current.optInt("relative_humidity_2m", 0),
-            windSpeed = current.optDouble("wind_speed_10m", 0.0),
-            windDirection = current.optInt("wind_direction_10m", 0),
-            weatherCode = current.optInt("weather_code", UNKNOWN_CODE),
-            isDay = current.optInt("is_day", 1) != 0,
-            fetchedAt = System.currentTimeMillis(),
-        )
+        // 把「缺字段 / 温度非法」这类软失败也当作该源不可用，继续尝试下一个源。
+        val now = trySources { source ->
+            val url = source.currentUrl(settings)
+                ?: throw IOException("${source.name} 不支持实时轮询")
+            val fast = source.timeout == Timeout.FAST
+            val body = if (fast) {
+                requestTextOnce(url, "获取实时天气失败", FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS)
+            } else {
+                text(url, "获取实时天气失败", FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS)
+            }
+            val parsed = try {
+                JSONObject(body)
+            } catch (e: Exception) {
+                throw IOException("获取实时天气失败：返回内容无法解析", e)
+            }
+            val root = source.normalize(parsed)
+            val current = root.optJSONObject("current")
+                ?: throw IOException("${source.name} 实时数据不完整")
+            val temp = current.optDouble("temperature_2m", Double.NaN)
+            if (temp.isNaN()) throw IOException("${source.name} 实时温度缺失")
+            WeatherNow(
+                temp = temp,
+                feelsLike = current.optDouble("apparent_temperature", temp),
+                humidity = current.optInt("relative_humidity_2m", 0),
+                windSpeed = current.optDouble("wind_speed_10m", 0.0),
+                windDirection = current.optInt("wind_direction_10m", 0),
+                weatherCode = current.optInt("weather_code", UNKNOWN_CODE),
+                isDay = current.optInt("is_day", 1) != 0,
+                fetchedAt = System.currentTimeMillis(),
+            )
+        }
+        // 所有源都成功返回但无有效数据时，维持原有「静默返回 null」语义（仓库侧不弹错）。
+        now
     }
 
     private suspend fun fetchForecast(settings: AppSettings): WeatherData {
-        val root = json(
-            forecastUrl(settings),
-            "获取天气失败",
-            connectTimeoutMs = CONNECT_TIMEOUT_MS,
-            readTimeoutMs = READ_TIMEOUT_MS,
-        )
-        val current = root.optJSONObject("current")
-        if (current == null || !current.has("temperature_2m")) {
-            throw IOException("天气数据不完整，请稍后重试")
+        val root = trySources { source ->
+            val parsed = sourceJson(source, settings, "获取天气失败")
+            // 软失败（缺 current / 缺温度）也要换下一个源。
+            val current = parsed.optJSONObject("current")
+            if (current == null || !current.has("temperature_2m")) {
+                throw IOException("${source.name} 天气数据不完整")
+            }
+            parsed
         }
+        val current = root.optJSONObject("current")!!
 
         val zone = resolveZone(root, settings)
         val now = ZonedDateTime.now(zone)
@@ -400,6 +475,185 @@ class WeatherClient {
             runCatching { ZoneOffset.ofTotalSeconds(offset) }.getOrNull()?.let { return it }
         }
         return ZoneId.systemDefault()
+    }
+
+    // ── 备用数据源 URL 与归一化 ───────────────────────────────────────────────
+
+    private fun wttrUrl(settings: AppSettings): String =
+        "https://wttr.in/${coord(settings.latitude)},${coord(settings.longitude)}?format=j1"
+
+    private fun wttrCurrentUrl(settings: AppSettings): String = wttrUrl(settings)
+
+    private fun metUrl(settings: AppSettings): String =
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact" +
+            "?lat=${coord(settings.latitude)}&lon=${coord(settings.longitude)}"
+
+    private fun metCurrentUrl(settings: AppSettings): String = metUrl(settings)
+
+    /** "06:12 AM" → "06:12"，"07:05 PM" → "19:05" */
+    private fun wttrClock(raw: String?): String {
+        if (raw == null || raw.length < 5) return ""
+        val hh = raw.substring(0, 2).toIntOrNull() ?: return ""
+        val mm = raw.substring(3, 5)
+        val pm = raw.contains("PM", ignoreCase = true)
+        val hour = if (pm && hh < 12) hh + 12 else if (!pm && hh == 12) 0 else hh
+        return String.format(Locale.US, "%02d:%s", hour, mm)
+    }
+
+    /** wttr.in 的 WWO 天气码 → WMO（与现有 weatherLabel 一致）。 */
+    private fun wmoFromWwo(code: Int): Int = when (code) {
+        113 -> 0
+        116 -> 2
+        119, 122 -> 3
+        143, 144, 146, 148, 155, 156 -> 45
+        176, 263, 266, 353, 356 -> 61
+        179, 182, 185, 323, 326, 329 -> 71
+        200, 201, 202 -> 95
+        else -> UNKNOWN_CODE
+    }
+
+    /** MET Norway 的 symbol_code → WMO。 */
+    private fun wmoFromSymbol(symbol: String): Int = when (symbol.substringBefore('_')) {
+        "clearsky" -> 0
+        "fair" -> 1
+        "partlycloudy" -> 2
+        "cloudy" -> 3
+        "fog" -> 45
+        "rain", "lightrain" -> 61
+        "snow", "lightsnow" -> 71
+        "thunderstorm" -> 95
+        else -> UNKNOWN_CODE
+    }
+
+    /** wttr.in 归一化成 Open-Meteo 同形：current + daily，无 hourly 时留空。 */
+    private fun normalizeWttr(root: JSONObject): JSONObject {
+        val cur = root.optJSONArray("current_condition")?.optJSONObject(0)
+            ?: throw IOException("wttr.in 天气数据不完整")
+        val current = JSONObject()
+            .put("temperature_2m", cur.optDouble("temp_C", Double.NaN))
+            .put("apparent_temperature", cur.optDouble("FeelsLikeC", Double.NaN))
+            .put("relative_humidity_2m", cur.optInt("humidity", 0))
+            .put("wind_speed_10m", cur.optDouble("windspeedKmph", 0.0))
+            .put("wind_direction_10m", cur.optInt("winddirDegree", 0))
+            .put("weather_code", wmoFromWwo(cur.optInt("weatherCode")))
+            .put("is_day", 1)
+        val out = JSONObject().put("current", current)
+
+        val days = root.optJSONArray("weather") ?: return out
+        val time = JSONArray(); val codes = JSONArray(); val highs = JSONArray()
+        val lows = JSONArray(); val rains = JSONArray(); val uvs = JSONArray()
+        val sunrises = JSONArray(); val sunsets = JSONArray()
+        for (i in 0 until days.length()) {
+            val d = days.optJSONObject(i) ?: continue
+            time.put(d.optString("date"))
+            highs.put(d.optDouble("maxtempC", 0.0))
+            lows.put(d.optDouble("mintempC", 0.0))
+            uvs.put(d.optDouble("uvIndex", 0.0))
+            val astro = d.optJSONArray("astronomy")?.optJSONObject(0)
+            // wttr 的 astronomy 是 "06:12 AM"；现有 clock() 只认 "…T…"，这里先裁成 HH:mm。
+            sunrises.put(wttrClock(astro?.optString("sunrise")))
+            sunsets.put(wttrClock(astro?.optString("sunset")))
+            val hours = d.optJSONArray("hourly")
+            var bestCode = UNKNOWN_CODE
+            var bestRain = 0
+            if (hours != null) {
+                for (h in 0 until hours.length()) {
+                    val hour = hours.optJSONObject(h) ?: continue
+                    val c = wmoFromWwo(hour.optInt("weatherCode"))
+                    if (c != UNKNOWN_CODE) { bestCode = c; bestRain = hour.optInt("chanceofrain", 0) }
+                }
+            }
+            codes.put(bestCode)
+            rains.put(bestRain)
+        }
+        out.put("daily", JSONObject()
+            .put("time", time).put("weather_code", codes)
+            .put("temperature_2m_max", highs).put("temperature_2m_min", lows)
+            .put("precipitation_probability_max", rains).put("uv_index_max", uvs)
+            .put("sunrise", sunrises).put("sunset", sunsets))
+        return out
+    }
+
+    /**
+     * MET Norway 归一化：current 取第一条 timeseries；daily / hourly 由整条序列生成。
+     * MET 的时间是 UTC 带 Z，这里转成 "yyyy-MM-dd" / "HH:mm" 才能喂给现有解析器；
+     * 时区固定 UTC 只是给 resolveZone 兜底，展示用的「今天」仍按设备设置时区。
+     */
+    private fun normalizeMet(root: JSONObject): JSONObject {
+        val times = root.optJSONObject("properties")?.optJSONArray("timeseries")
+            ?: throw IOException("met.no 天气数据不完整")
+        if (times.length() == 0) throw IOException("met.no 天气数据不完整")
+
+        val dailyTime = JSONArray(); val dailyCode = JSONArray()
+        val dailyHigh = JSONArray(); val dailyLow = JSONArray()
+        val dailyRain = JSONArray(); val dailyUv = JSONArray()
+        val sunrise = JSONArray(); val sunset = JSONArray()
+        val hourlyTime = JSONArray(); val hourlyTemp = JSONArray()
+        val hourlyCode = JSONArray(); val hourlyRain = JSONArray()
+        val byDate = LinkedHashMap<String, MutableList<Double>>()
+        val byDateCode = LinkedHashMap<String, MutableList<Int>>()
+        var firstInstant: JSONObject? = null
+        var firstSymbol = ""
+
+        for (i in 0 until times.length()) {
+            val t = times.optJSONObject(i) ?: continue
+            val data = t.optJSONObject("data") ?: continue
+            val details = data.optJSONObject("instant")?.optJSONObject("details") ?: continue
+            val iso = t.optString("time")
+            if (iso.length < 16) continue
+            val date = iso.substring(0, 10)
+            val hhmm = iso.substring(11, 16)
+            val temp = details.optDouble("air_temperature", Double.NaN)
+            val symbol = data.optJSONObject("next_1_hours")
+                ?.optJSONObject("summary")?.optString("symbol_code").orEmpty()
+            if (firstInstant == null) {
+                firstInstant = details
+                firstSymbol = symbol
+            }
+            // 未来 12 小时逐小时：超过 12 条就不再加
+            if (hourlyTime.length() < HOURS_AHEAD) {
+                hourlyTime.put(hhmm); hourlyTemp.put(temp)
+                hourlyCode.put(if (symbol.isBlank()) UNKNOWN_CODE else wmoFromSymbol(symbol))
+                hourlyRain.put(0)
+            }
+            // 每天的记录先攒着，最后统一算 max/min
+            val code = if (symbol.isBlank()) UNKNOWN_CODE else wmoFromSymbol(symbol)
+            byDate.getOrPut(date) { ArrayList() }.add(temp)
+            byDateCode.getOrPut(date) { ArrayList() }.add(code)
+        }
+        for ((date, temps) in byDate) {
+            val codes = byDateCode[date].orEmpty()
+            dailyTime.put(date)
+            dailyCode.put(codes.firstOrNull { it != UNKNOWN_CODE } ?: UNKNOWN_CODE)
+            dailyHigh.put(if (temps.isEmpty()) 0.0 else temps.maxOrNull()!!)
+            dailyLow.put(if (temps.isEmpty()) 0.0 else temps.minOrNull()!!)
+            dailyRain.put(0); dailyUv.put(0.0)
+            sunrise.put(""); sunset.put("")
+        }
+
+        val instant = firstInstant ?: throw IOException("met.no 天气数据不完整")
+        val temp = instant.optDouble("air_temperature", Double.NaN)
+        val current = JSONObject()
+            .put("temperature_2m", temp)
+            .put("apparent_temperature", temp)
+            .put("relative_humidity_2m", instant.optInt("relative_humidity", 0))
+            // MET 风速是 m/s，换算成 km/h 与 Open-Meteo 保持一致。
+            .put("wind_speed_10m", instant.optDouble("wind_speed", 0.0) * 3.6)
+            .put("wind_direction_10m", instant.optInt("wind_from_direction", 0))
+            .put("weather_code", if (firstSymbol.isBlank()) UNKNOWN_CODE else wmoFromSymbol(firstSymbol))
+            .put("is_day", 1)
+
+        return JSONObject()
+            .put("current", current)
+            .put("timezone", "UTC")
+            .put("hourly", JSONObject()
+                .put("time", hourlyTime).put("temperature_2m", hourlyTemp)
+                .put("weather_code", hourlyCode).put("precipitation_probability", hourlyRain))
+            .put("daily", JSONObject()
+                .put("time", dailyTime).put("weather_code", dailyCode)
+                .put("temperature_2m_max", dailyHigh).put("temperature_2m_min", dailyLow)
+                .put("precipitation_probability_max", dailyRain).put("uv_index_max", dailyUv)
+                .put("sunrise", sunrise).put("sunset", sunset))
     }
 
     // ── URL ─────────────────────────────────────────────────────────────────

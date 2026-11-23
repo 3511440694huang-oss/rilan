@@ -45,6 +45,21 @@ object CrashLog {
         runCatching { file(context).delete() }
     }
 
+    /**
+     * 记录一条「已处理、不该杀进程」的异常，供排查用。与 [write] 不同：
+     * 不覆盖 last-crash.txt（那是给未捕获异常用的），而是追加到独立的后台日志，
+     * 避免用户看到「崩溃记录」以为真的闪退了。
+     */
+    fun note(context: Context, tag: String, error: Throwable) {
+        runCatching {
+            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date())
+            val line = "$time [$tag] ${error.stackTraceToString().take(4000)}"
+            val f = File(context.filesDir, "background-errors.txt")
+            val old = if (f.exists()) f.readText(Charsets.UTF_8) else ""
+            f.writeText((old + line + "\n\n").takeLast(MAX_CHARS), Charsets.UTF_8)
+        }
+    }
+
     fun file(context: Context): File = File(context.filesDir, FILE_NAME)
 
     private fun write(context: Context, thread: Thread, error: Throwable) {
