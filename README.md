@@ -31,12 +31,12 @@
 ## 下载
 
 - 最新 Release：[github.com/3511440694huang-oss/rilan/releases](https://github.com/3511440694huang-oss/rilan/releases)
-- 当前版本：`rilan-1.8.0.apk`（6.2 MB）
-- SHA-256：`1986e90cd5db6e41eb4eb26dbafe2a7f6f7fbb6d4f8cc8cd7464581fdb5bac77`
+- 当前版本：`rilan-1.8.1.apk`（6.2 MB）
+- SHA-256：`acfd749370ee134bbfc6ee2c6405b17c288911bd398573b049db1d7d225388ff`
 
 ## 安装
 
-1. 下载 `rilan-1.8.0.apk`，允许「安装未知来源应用」后安装。
+1. 下载 `rilan-1.8.1.apk`，允许「安装未知来源应用」后安装。
 2. 首次启动会说明定位用途并请求权限；拒绝也不影响信息流、日程与回望，只是天气改用城市名手动指定。
 3. Android 13 及以上，打开「今日简报」通知开关时会请求通知权限；没有权限时通知静默跳过，不会崩溃。
 4. 想让每日通知或 MCP 在开机后自动恢复，可打开「扩展 → 更多 → 开机自启动」；
@@ -235,13 +235,19 @@ bash build.sh :app:testDebugUnitTest :app:assembleRelease
 
 ## 构建信息
 
-- 版本：1.8.0（versionCode 15）
-- APK：`rilan-1.8.0.apk`，6,531,659 字节
-- APK SHA-256：`1986e90cd5db6e41eb4eb26dbafe2a7f6f7fbb6d4f8cc8cd7464581fdb5bac77`
+- 版本：1.8.1（versionCode 16）
+- APK：`rilan-1.8.1.apk`，6,534,343 字节
+- APK SHA-256：`acfd749370ee134bbfc6ee2c6405b17c288911bd398573b049db1d7d225388ff`
 - 签名证书 SHA-256：`1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd`（与 1.6.0 相同）
 - 单元测试：43/43 通过（日程重复与生日跨年 9、数日子 15、插件解析 6、MCP 协议与鉴权 6、DeepSeek 响应 3、定位文案 2、HTTP 条件请求 2）
 
 ## 更新日志
+
+### 1.8.1
+
+- **日程 / 纪念日切换有了过渡**：分段滑块跟着选中项滑动，点按时有轻微按压回弹；
+  下方整块内容横向推进 + 淡入淡出（去程从右进、回程从左进），标题与「+」文案同步淡入淡出。
+- 过渡只发生在分段内容这一块，不新起列表、不打断外层滚动；内容高度不做动画，避免整页跟着抖。
 
 ### 1.8.0
 

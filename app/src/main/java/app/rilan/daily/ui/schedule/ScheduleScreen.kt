@@ -3,15 +3,25 @@
 package app.rilan.daily.ui.schedule
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,6 +57,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -132,24 +148,31 @@ fun ScheduleScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
+            // 标题跟着分段淡入淡出：只换文案与「+」的语义，位置不动。
             item {
-                ScreenTitle(
-                    eyebrow = if (showingAnniversaries) "纪念日" else "日程",
-                    title = if (showingAnniversaries) "数着过的日子" else "先安排重要的事",
-                    subtitle = if (showingAnniversaries) {
-                        "过去多少天，未来还有多少天"
-                    } else {
-                        "提前一点，给在意的事留出位置"
-                    },
-                    actions = {
-                        GlassIconButton(
-                            icon = Icons.Filled.Add,
-                            contentDescription = if (showingAnniversaries) "新建纪念日" else "新建日程",
-                            // 纪念日段不跟月历的选中日走，默认落到今天。
-                            onClick = { openNew(if (showingAnniversaries) today else selectedDate) },
-                        )
-                    },
-                )
+                Crossfade(
+                    targetState = showingAnniversaries,
+                    animationSpec = tween(240),
+                    label = "scheduleTitle",
+                ) { anniversaries ->
+                    ScreenTitle(
+                        eyebrow = if (anniversaries) "纪念日" else "日程",
+                        title = if (anniversaries) "数着过的日子" else "先安排重要的事",
+                        subtitle = if (anniversaries) {
+                            "过去多少天，未来还有多少天"
+                        } else {
+                            "提前一点，给在意的事留出位置"
+                        },
+                        actions = {
+                            GlassIconButton(
+                                icon = Icons.Filled.Add,
+                                contentDescription = if (anniversaries) "新建纪念日" else "新建日程",
+                                // 纪念日段不跟月历的选中日走，默认落到今天。
+                                onClick = { openNew(if (anniversaries) today else selectedDate) },
+                            )
+                        },
+                    )
+                }
             }
 
             item {
@@ -159,91 +182,114 @@ fun ScheduleScreen(
                 )
             }
 
-            if (!showingAnniversaries) {
-                item {
-                    MonthSummary(
-                        total = monthTotal,
-                        high = monthHigh,
-                        reminderLabel = reminderLabel,
-                    )
-                }
-
-                if (!notificationsEnabled) {
-                    item {
-                        NotificationBanner(
-                            reminderLabel = reminderLabel,
-                            onRequest = onRequestNotification,
+            // 两个分段共用同一个 LazyColumn：切换时整块内容横向推进 + 淡入淡出。
+            // 过渡只发生在这一个 item 里，不新起列表、不打断外层滚动。
+            item {
+                AnimatedContent(
+                    targetState = segment,
+                    // 切换时新旧两屏高度不同，裁到当前 item 里，避免滑出的内容溢出到下方。
+                    modifier = Modifier.fillMaxWidth().clipToBounds(),
+                    transitionSpec = {
+                        val forward = targetState == ScheduleSegment.ANNIVERSARY
+                        val dir = if (forward) 1 else -1
+                        val enter = slideInHorizontally(
+                            animationSpec = tween(320, easing = FastOutSlowInEasing),
+                        ) { width -> dir * width / 7 } + fadeIn(tween(260))
+                        val exit = slideOutHorizontally(
+                            animationSpec = tween(260, easing = FastOutSlowInEasing),
+                        ) { width -> -dir * width / 9 } + fadeOut(tween(150))
+                        // 两个分段高度差很大，尺寸不做动画：内容滑走即可，
+                        // 由 SizeTransform 驱动的整块高度动画会让外层列表跟着一抖一抖。
+                        ContentTransform(
+                            targetContentEnter = enter,
+                            initialContentExit = exit,
+                            targetContentZIndex = 0f,
+                            sizeTransform = null,
                         )
-                    }
-                }
-
-                item {
-                    CalendarCard(
-                        events = events,
-                        selectedDate = selectedDate,
-                        month = month,
-                        onSelectDate = { date ->
-                            selectedDate = date
-                            month = YearMonth.from(date)
-                        },
-                        onMonthChange = { month = it },
-                    )
-                }
-
-                // 选中日：整块一起做切换动画，避免列表 item 各自的动画互相打架
-                item {
-                    AnimatedContent(
-                        targetState = selectedDate,
-                        transitionSpec = {
-                            (fadeIn(tween(220)) + slideInVertically(tween(260)) { full -> full / 14 }) togetherWith
-                                (fadeOut(tween(140)) + slideOutVertically(tween(180)) { full -> -full / 20 })
-                        },
-                        label = "dayPanel",
-                    ) { date ->
-                        val dayEvents = remember(events, date) { sortDayEvents(events, date) }
-                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            DayHeader(date = date, events = dayEvents)
-                            if (dayEvents.isEmpty()) {
-                                EmptyDayCard(onAdd = { openNew(date) })
-                            } else {
-                                dayEvents.forEach { event ->
-                                    EventRow(
-                                        event = event,
-                                        date = date,
-                                        onOpen = { openEdit(event) },
-                                        onToggleDone = { onToggleDone(event.id, date.toString()) },
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                item {
-                    UpcomingSection(items = upcoming, onOpen = openEdit)
-                }
-            } else {
-                item {
-                    AnniversarySummary(counters = counters)
-                }
-
-                if (counters.isEmpty()) {
-                    item {
-                        AnniversaryEmptyCard(onAdd = { openNew(today) })
-                    }
-                } else {
-                    // 纪念日一般只有几条，直接放进外层 LazyColumn 的一个 item 里，
-                    // 不嵌套可滚动容器；条目再多也只是一次性组装普通的 Column。
-                    item {
+                    },
+                    label = "scheduleSegment",
+                ) { current ->
+                    if (current == ScheduleSegment.SCHEDULE) {
                         Column(
                             Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(14.dp),
                         ) {
-                            counters.forEach { counter ->
-                                DayCountCard(
-                                    counter = counter,
-                                    onClick = { openEdit(counter.event) },
+                            MonthSummary(
+                                total = monthTotal,
+                                high = monthHigh,
+                                reminderLabel = reminderLabel,
+                            )
+
+                            if (!notificationsEnabled) {
+                                NotificationBanner(
+                                    reminderLabel = reminderLabel,
+                                    onRequest = onRequestNotification,
                                 )
+                            }
+
+                            CalendarCard(
+                                events = events,
+                                selectedDate = selectedDate,
+                                month = month,
+                                onSelectDate = { date ->
+                                    selectedDate = date
+                                    month = YearMonth.from(date)
+                                },
+                                onMonthChange = { month = it },
+                            )
+
+                            // 选中日：整块一起做切换动画，避免列表 item 各自的动画互相打架
+                            AnimatedContent(
+                                targetState = selectedDate,
+                                transitionSpec = {
+                                    (fadeIn(tween(220)) + slideInVertically(tween(260)) { full -> full / 14 }) togetherWith
+                                        (fadeOut(tween(140)) + slideOutVertically(tween(180)) { full -> -full / 20 })
+                                },
+                                label = "dayPanel",
+                            ) { date ->
+                                val dayEvents = remember(events, date) { sortDayEvents(events, date) }
+                                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    DayHeader(date = date, events = dayEvents)
+                                    if (dayEvents.isEmpty()) {
+                                        EmptyDayCard(onAdd = { openNew(date) })
+                                    } else {
+                                        dayEvents.forEach { event ->
+                                            EventRow(
+                                                event = event,
+                                                date = date,
+                                                onOpen = { openEdit(event) },
+                                                onToggleDone = { onToggleDone(event.id, date.toString()) },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            UpcomingSection(items = upcoming, onOpen = openEdit)
+                        }
+                    } else {
+                        Column(
+                            Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            AnniversarySummary(counters = counters)
+
+                            if (counters.isEmpty()) {
+                                AnniversaryEmptyCard(onAdd = { openNew(today) })
+                            } else {
+                                // 纪念日一般只有几条，直接放进同一个 item 里，
+                                // 不嵌套可滚动容器；条目再多也只是一次性组装普通的 Column。
+                                Column(
+                                    Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    counters.forEach { counter ->
+                                        DayCountCard(
+                                            counter = counter,
+                                            onClick = { openEdit(counter.event) },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -284,33 +330,72 @@ private fun SegmentSwitch(
     selected: ScheduleSegment,
     onSelect: (ScheduleSegment) -> Unit,
 ) {
-    Row(
+    // 滑块位移只在绘制阶段读：切换时只重绘这一块，不触发整段重组。
+    val progress by animateFloatAsState(
+        targetValue = if (selected == ScheduleSegment.ANNIVERSARY) 1f else 0f,
+        animationSpec = spring(stiffness = 380f, dampingRatio = 0.82f),
+        label = "segmentPill",
+    )
+    Box(
         Modifier
             .fillMaxWidth()
             .clip(CircleShape)
             .background(Color(0x12FFFFFF))
             .border(0.75.dp, Color(0x1FFFFFFF), CircleShape)
-            .padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        ScheduleSegment.entries.forEach { item ->
-            val active = item == selected
-            Box(
-                Modifier
-                    .weight(1f)
-                    .clip(CircleShape)
-                    .background(if (active) Color(0x1FFFFFFF) else Color.Transparent)
-                    .clickable { onSelect(item) }
-                    // 竖向 12dp + 文字行高 ≈ 46dp，满足 44dp 的最小点击区。
-                    .padding(vertical = 12.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = item.label,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (active) RilanColors.Text else RilanColors.TextTertiary,
-                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+            .drawBehind {
+                // 轨道内左右各留 3dp；滑块宽度恒为一半，用 progress 在绘制层平移。
+                val inset = 3.dp.toPx()
+                val pillWidth = (size.width - inset * 2f) / 2f
+                val pillHeight = size.height - inset * 2f
+                drawRoundRect(
+                    color = Color(0x1FFFFFFF),
+                    topLeft = Offset(inset + progress * pillWidth, inset),
+                    size = Size(pillWidth, pillHeight),
+                    cornerRadius = CornerRadius(pillHeight / 2f),
                 )
+            }
+            .padding(3.dp),
+    ) {
+        Row(Modifier.fillMaxWidth()) {
+            ScheduleSegment.entries.forEach { item ->
+                val active = item == selected
+                val interaction = remember { MutableInteractionSource() }
+                val pressed by interaction.collectIsPressedAsState()
+                // 按下的缩放做在独立图层上，只影响这一小块的绘制。
+                val pressScale by animateFloatAsState(
+                    targetValue = if (pressed) 0.96f else 1f,
+                    animationSpec = spring(stiffness = 640f, dampingRatio = 0.72f),
+                    label = "segmentPress",
+                )
+                val tint by animateColorAsState(
+                    targetValue = if (active) RilanColors.Text else RilanColors.TextTertiary,
+                    animationSpec = tween(220),
+                    label = "segmentTint",
+                )
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .graphicsLayer {
+                            scaleX = pressScale
+                            scaleY = pressScale
+                        }
+                        .clip(CircleShape)
+                        .clickable(
+                            interactionSource = interaction,
+                            indication = null,
+                        ) { onSelect(item) }
+                        // 竖向 12dp + 文字行高 ≈ 46dp，满足 44dp 的最小点击区。
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = item.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = tint,
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                    )
+                }
             }
         }
     }
