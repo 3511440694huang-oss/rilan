@@ -251,7 +251,14 @@ private fun WeatherTop(
                     weather == null -> "还没有天气数据"
                     else -> listOf(
                         weather.localityLabel,
-                        updatedText(weather.updatedAt).ifBlank { "刚刚更新" },
+                        if (weather.isPreview) {
+                            // 占位数据只有实时温度，明确告诉用户预报还在补，别当成最终数据。
+                            "正在补全预报"
+                        } else {
+                            updatedText(weather.updatedAt).ifBlank { "刚刚更新" }
+                        },
+                        // 有旧数据时刷新不打骨架屏，只在头部给一个不打断阅读的轻提示。
+                        if (refreshing && !weather.isPreview) "更新中" else "",
                     ).filter { it.isNotBlank() }.joinToString(" · ")
                 },
                 style = MaterialTheme.typography.labelSmall,
@@ -339,12 +346,22 @@ private fun WeatherBody(weather: WeatherData) {
                     color = RilanColors.Text,
                     maxLines = 1,
                 )
-                Text(
-                    "最高 ${weather.high.roundToInt()}°   最低 ${weather.low.roundToInt()}°",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = RilanColors.TextSecondary,
-                    maxLines = 1,
-                )
+                if (weather.isPreview) {
+                    // 高低温还没拿到：不要用当前温度冒充「最高/最低」。
+                    Text(
+                        "正在补全预报…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = RilanColors.TextSecondary,
+                        maxLines = 1,
+                    )
+                } else {
+                    Text(
+                        "最高 ${weather.high.roundToInt()}°   最低 ${weather.low.roundToInt()}°",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = RilanColors.TextSecondary,
+                        maxLines = 1,
+                    )
+                }
                 Text(
                     "体感 ${weather.feelsLike.roundToInt()}°",
                     style = MaterialTheme.typography.labelSmall,
@@ -525,8 +542,10 @@ private fun MetricGrid(weather: WeatherData) {
     if (weather.uvIndex > 0.0) {
         metrics += "紫外线" to uvLabel(weather.uvIndex)
     }
-    if (metrics.size < 4) {
-        metrics += "日照" to daylightLabel(weather.sunrise, weather.sunset).ifBlank { "—" }
+    val daylight = daylightLabel(weather.sunrise, weather.sunset)
+    // 取不到日出日落时（含冷启动占位数据）不塞一个「—」占位格。
+    if (metrics.size < 4 && daylight.isNotBlank()) {
+        metrics += "日照" to daylight
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -617,6 +636,14 @@ private fun WeatherMissing(onRefresh: () -> Unit) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 色彩与格式
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 冷启动占位天气：只有实时温度，逐小时 / 一周预报都还没到（见 AppRepository 的
+ * 「先出温度」）。这种数据只存在内存里、不会落盘，卡片据此不画预报区块，
+ * 也不把当前温度冒充成最高 / 最低温。
+ */
+private val WeatherData.isPreview: Boolean
+    get() = daily.isEmpty() && hourly.isEmpty()
 
 private fun weatherTint(weather: WeatherData): Color {
     return when (weatherGlyphKind(weather.weatherCode, weather.isDay)) {

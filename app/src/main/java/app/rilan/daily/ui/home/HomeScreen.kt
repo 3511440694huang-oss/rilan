@@ -86,12 +86,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.rilan.daily.core.Category
+import app.rilan.daily.core.DayCounter
+import app.rilan.daily.core.Direction
 import app.rilan.daily.core.EventKind
 import app.rilan.daily.core.HomeState
 import app.rilan.daily.core.NewsItem
 import app.rilan.daily.core.NewsSection
 import app.rilan.daily.core.Priority
 import app.rilan.daily.core.ScheduleEvent
+import app.rilan.daily.core.buildDayCounters
 import app.rilan.daily.core.formatHotValue
 import app.rilan.daily.core.relativeTimeLabel
 import app.rilan.daily.schedule.Recurrence
@@ -228,7 +231,7 @@ fun HomeScreen(
                         weather = state.weather,
                         wallpaper = state.wallpaper,
                         loading = state.loading,
-                        refreshing = state.refreshing,
+                        refreshing = state.weatherRefreshing,
                         error = state.weatherError,
                         locating = state.locating,
                         locationError = state.locationError,
@@ -1159,6 +1162,8 @@ private fun TodayPage(
             if (days in 1..14) Upcoming(event, next, days) else null
         }.sortedWith(compareBy<Upcoming> { it.date }.thenBy { it.event.time ?: "" }).take(4)
     }
+    // 纪念日条：复用同一份 events，取最近的 3 条，不新增数据源。
+    val dayCounters = remember(events, today) { buildDayCounters(events, today).take(3) }
     val specialCount = todayEvents.count {
         it.kind == EventKind.BIRTHDAY || it.kind == EventKind.ANNIVERSARY
     }
@@ -1252,6 +1257,23 @@ private fun TodayPage(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     upcoming.forEach { item ->
                         UpcomingRow(item)
+                    }
+                }
+            }
+
+            // 纪念日：放在「接下来」之后、底部入口之前，不挤占今天的主内容；没有就不显示。
+            if (dayCounters.isNotEmpty()) {
+                GlassDivider()
+                SectionLabel("纪念日", RilanColors.Lilac) {
+                    Text(
+                        "${dayCounters.size} 个日子",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = RilanColors.TextTertiary,
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    dayCounters.forEach { counter ->
+                        HomeDayCountRow(counter = counter, onClick = onOpenSchedule)
                     }
                 }
             }
@@ -1372,6 +1394,93 @@ private fun UpcomingRow(item: Upcoming) {
         )
         item.event.time?.let {
             Text(it, style = MaterialTheme.typography.labelSmall, color = RilanColors.TextTertiary)
+        }
+    }
+}
+
+/**
+ * 首页的纪念日紧凑行：大数字天 + 标题 + 日期 / 还有多少天。
+ * 点整行打开日程页；页内再切到「纪念日」分段就能看到卡片与详情。
+ */
+@Composable
+private fun HomeDayCountRow(counter: DayCounter, onClick: () -> Unit) {
+    val isToday = counter.direction == Direction.TODAY
+    val accent = when {
+        isToday -> RilanColors.Mint
+        counter.direction == Direction.PAST -> RilanColors.TextTertiary
+        counter.event.kind == EventKind.BIRTHDAY -> RilanColors.Lilac
+        counter.event.kind == EventKind.ANNIVERSARY -> RilanColors.Dawn
+        else -> RilanColors.Sky
+    }
+    // 未来只显示日期和第几个（天数已经在左边的大数字里）；过去补一句「已经 N 天」表方向。
+    val dateText = "${counter.anchor.monthValue}月${counter.anchor.dayOfMonth}日"
+    val metaText = if (counter.direction == Direction.PAST) {
+        "$dateText · 已经过去"
+    } else {
+        val ordinalText = counter.ordinal?.let { ordinal ->
+            when (counter.event.kind) {
+                EventKind.BIRTHDAY -> " · 第 $ordinal 个生日"
+                EventKind.ANNIVERSARY -> " · 第 $ordinal 个纪念日"
+                else -> " · 第 $ordinal 次"
+            }
+        }.orEmpty()
+        dateText + ordinalText
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color.White.copy(alpha = 0.045f))
+            .border(0.6.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.width(70.dp)) {
+            if (!isToday) {
+                // 纪念日是「已经」，生日 / 倒计时是「还有」；方向必须和大数字一起出现。
+                Text(
+                    text = counter.primaryLabel,
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                    color = accent.copy(alpha = 0.72f),
+                    maxLines = 1,
+                )
+            }
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    text = if (isToday) "今天" else counter.primaryDays.toString(),
+                    style = MaterialTheme.typography.headlineSmall.copy(
+                        fontSize = if (isToday) 17.sp else 22.sp,
+                        lineHeight = 24.sp,
+                    ),
+                    color = accent,
+                    maxLines = 1,
+                )
+                if (!isToday) {
+                    Text(
+                        text = "天",
+                        modifier = Modifier.padding(start = 2.dp, bottom = 3.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = accent.copy(alpha = 0.72f),
+                    )
+                }
+            }
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = counter.event.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = RilanColors.Text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = metaText,
+                style = MaterialTheme.typography.labelSmall,
+                color = RilanColors.TextTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

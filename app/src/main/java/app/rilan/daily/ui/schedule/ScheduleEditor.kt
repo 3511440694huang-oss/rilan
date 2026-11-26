@@ -83,6 +83,9 @@ import kotlinx.coroutines.launch
 fun ScheduleEditor(
     event: ScheduleEvent?,
     initialDate: LocalDate = LocalDate.now(),
+    // 新建时的默认类型：日程页「纪念日」分段点「+」直接以纪念日 / 倒计时打开。
+    // 有默认值，原有调用点不用改；编辑已有事件时仍以事件自己的 kind 为准。
+    initialKind: EventKind = EventKind.TASK,
     onDismiss: () -> Unit,
     onAdd: (ScheduleEvent) -> Unit,
     onUpdate: (ScheduleEvent) -> Unit,
@@ -94,17 +97,17 @@ fun ScheduleEditor(
     val focusRequester = remember { FocusRequester() }
 
     val isNew = event == null
-    val initialKind = event?.kind ?: EventKind.TASK
+    val seedKind = event?.kind ?: initialKind
 
     var title by remember(event) { mutableStateOf(event?.title.orEmpty()) }
     var notes by remember(event) { mutableStateOf(event?.notes.orEmpty()) }
     var date by remember(event) { mutableStateOf(parseDate(event?.startDate) ?: initialDate) }
     var time by remember(event) { mutableStateOf(event?.time?.takeIf { parseHHmm(it) != null }) }
     var priority by remember(event) { mutableStateOf(event?.priority ?: Priority.MEDIUM) }
-    var kind by remember(event) { mutableStateOf(initialKind) }
+    var kind by remember(event) { mutableStateOf(seedKind) }
     var repeat by remember(event) {
         mutableStateOf(
-            if (initialKind == EventKind.BIRTHDAY || initialKind == EventKind.ANNIVERSARY) {
+            if (seedKind == EventKind.BIRTHDAY || seedKind == EventKind.ANNIVERSARY) {
                 RepeatRule.YEARLY
             } else {
                 event?.repeat ?: RepeatRule.NONE
@@ -116,6 +119,22 @@ fun ScheduleEditor(
 
     val repeatLocked = kind == EventKind.BIRTHDAY || kind == EventKind.ANNIVERSARY
     val sheetShape = RoundedCornerShape(topStart = 30.dp, topEnd = 30.dp)
+
+    // 面板标题跟着入口走：从纪念日分段进来时，一眼能看出在新建什么。
+    val editorTitle = when {
+        isNew && seedKind == EventKind.ANNIVERSARY -> "新建纪念日"
+        isNew && seedKind == EventKind.BIRTHDAY -> "新建生日"
+        isNew && seedKind == EventKind.COUNTDOWN -> "新建倒计时"
+        isNew -> "新建日程"
+        seedKind == EventKind.TASK -> "编辑日程"
+        else -> "编辑${seedKind.label}"
+    }
+    val editorHint = when {
+        !isNew -> "改完记得保存"
+        seedKind == EventKind.ANNIVERSARY || seedKind == EventKind.BIRTHDAY -> "每年同一天自动出现，日子会一直数下去"
+        seedKind == EventKind.COUNTDOWN -> "写下起点，之后每天都会数"
+        else -> "记下一件值得被提醒的事"
+    }
 
     // 先让数据落地，再收起面板，列表能立刻反映结果
     val dismissWith: (() -> Unit) -> Unit = { action ->
@@ -223,13 +242,13 @@ fun ScheduleEditor(
             ) {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        text = if (isNew) "新建日程" else "编辑日程",
+                        text = editorTitle,
                         style = MaterialTheme.typography.headlineSmall,
                         color = RilanColors.Text,
                     )
                     Spacer(Modifier.height(3.dp))
                     Text(
-                        text = if (isNew) "记下一件值得被提醒的事" else "改完记得保存",
+                        text = editorHint,
                         style = MaterialTheme.typography.labelSmall,
                         color = RilanColors.TextTertiary,
                     )

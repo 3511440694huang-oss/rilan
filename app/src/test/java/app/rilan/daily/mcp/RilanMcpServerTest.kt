@@ -17,14 +17,27 @@ class RilanMcpServerTest {
 
     private lateinit var server: RilanMcpServer
     private val token = "test-token-1234567890"
-    private val port = 18765
+    /**
+     * 端口不再写死 18765：设备上偶尔有残留监听（上一次测试进程 / 其他调试进程）占着它，
+     * 会让整类测试在 @Before 直接失败。每次从系统临时端口里取一个，取不到再顺延重试。
+     */
+    private var port = freePort()
 
     @Before
     fun setUp() {
-        server = RilanMcpServer(FakeHost(), token, port)
-        val result = server.start()
-        assertTrue(result.exceptionOrNull()?.message, result.isSuccess)
+        var last: Result<Unit>? = null
+        for (attempt in 0 until 5) {
+            server = RilanMcpServer(FakeHost(), token, port)
+            last = server.start()
+            if (last.isSuccess) return
+            port = freePort()
+        }
+        assertTrue(last?.exceptionOrNull()?.message, last?.isSuccess == true)
     }
+
+    private fun freePort(): Int = runCatching {
+        java.net.ServerSocket(0).use { it.localPort }
+    }.getOrDefault(18765)
 
     @After
     fun tearDown() {

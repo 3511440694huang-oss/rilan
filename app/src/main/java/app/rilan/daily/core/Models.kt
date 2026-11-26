@@ -236,6 +236,8 @@ enum class EventKind(val label: String) {
     TASK("日程"),
     BIRTHDAY("生日"),
     ANNIVERSARY("纪念日"),
+    // 倒计时：同一个日期从今天往后数（或从过去某天往前数），复用 ScheduleEvent，不另建存储。
+    COUNTDOWN("倒计时"),
     MEMO("备忘");
 
     companion object {
@@ -404,6 +406,8 @@ data class HomeState(
     val sections: List<NewsSection> = emptyList(),
     val loading: Boolean = true,
     val refreshing: Boolean = false,
+    /** 天气自己的刷新标记：信息流 / 壁纸刷新时不该让天气卡显示「更新中」。 */
+    val weatherRefreshing: Boolean = false,
     val lastUpdated: Long = 0L,
     val weatherError: String? = null,
     val contentError: String? = null,

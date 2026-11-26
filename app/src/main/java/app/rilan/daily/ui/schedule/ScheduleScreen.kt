@@ -54,10 +54,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.rilan.daily.core.DayCounter
+import app.rilan.daily.core.Direction
 import app.rilan.daily.core.EventKind
 import app.rilan.daily.core.Priority
 import app.rilan.daily.core.RepeatRule
 import app.rilan.daily.core.ScheduleEvent
+import app.rilan.daily.core.buildDayCounters
 import app.rilan.daily.ui.components.EmptyState
 import app.rilan.daily.ui.components.GlassCard
 import app.rilan.daily.ui.components.GlassDivider
@@ -93,12 +96,19 @@ fun ScheduleScreen(
     var month by remember { mutableStateOf(YearMonth.from(today)) }
     var editorVisible by remember { mutableStateOf(false) }
     var editingEvent by remember { mutableStateOf<ScheduleEvent?>(null) }
+    // 日程 / 纪念日 二段切换：只换下面显示的内容，不新增页面、不新增底部入口。
+    var segment by remember { mutableStateOf(ScheduleSegment.SCHEDULE) }
+    var editorKind by remember { mutableStateOf(EventKind.TASK) }
 
+    val showingAnniversaries = segment == ScheduleSegment.ANNIVERSARY
     val upcoming = remember(events, today) { buildUpcoming(events, today) }
     val (monthTotal, monthHigh) = remember(events, month) { countMonth(events, month) }
+    val counters = remember(events, today) { buildDayCounters(events, today) }
 
     val openNew: (LocalDate) -> Unit = { date ->
         editingEvent = null
+        // 纪念日分段点「+」，直接以纪念日打开；倒计时可以在面板的类型里换。
+        editorKind = if (showingAnniversaries) EventKind.ANNIVERSARY else EventKind.TASK
         selectedDate = date
         month = YearMonth.from(date)
         editorVisible = true
@@ -124,80 +134,120 @@ fun ScheduleScreen(
         ) {
             item {
                 ScreenTitle(
-                    eyebrow = "日程",
-                    title = "先安排重要的事",
-                    subtitle = "提前一点，给在意的事留出位置",
+                    eyebrow = if (showingAnniversaries) "纪念日" else "日程",
+                    title = if (showingAnniversaries) "数着过的日子" else "先安排重要的事",
+                    subtitle = if (showingAnniversaries) {
+                        "过去多少天，未来还有多少天"
+                    } else {
+                        "提前一点，给在意的事留出位置"
+                    },
                     actions = {
                         GlassIconButton(
                             icon = Icons.Filled.Add,
-                            contentDescription = "新建日程",
-                            onClick = { openNew(selectedDate) },
+                            contentDescription = if (showingAnniversaries) "新建纪念日" else "新建日程",
+                            // 纪念日段不跟月历的选中日走，默认落到今天。
+                            onClick = { openNew(if (showingAnniversaries) today else selectedDate) },
                         )
                     },
                 )
             }
 
             item {
-                MonthSummary(
-                    total = monthTotal,
-                    high = monthHigh,
-                    reminderLabel = reminderLabel,
+                SegmentSwitch(
+                    selected = segment,
+                    onSelect = { segment = it },
                 )
             }
 
-            if (!notificationsEnabled) {
+            if (!showingAnniversaries) {
                 item {
-                    NotificationBanner(
+                    MonthSummary(
+                        total = monthTotal,
+                        high = monthHigh,
                         reminderLabel = reminderLabel,
-                        onRequest = onRequestNotification,
                     )
                 }
-            }
 
-            item {
-                CalendarCard(
-                    events = events,
-                    selectedDate = selectedDate,
-                    month = month,
-                    onSelectDate = { date ->
-                        selectedDate = date
-                        month = YearMonth.from(date)
-                    },
-                    onMonthChange = { month = it },
-                )
-            }
+                if (!notificationsEnabled) {
+                    item {
+                        NotificationBanner(
+                            reminderLabel = reminderLabel,
+                            onRequest = onRequestNotification,
+                        )
+                    }
+                }
 
-            // 选中日：整块一起做切换动画，避免列表 item 各自的动画互相打架
-            item {
-                AnimatedContent(
-                    targetState = selectedDate,
-                    transitionSpec = {
-                        (fadeIn(tween(220)) + slideInVertically(tween(260)) { full -> full / 14 }) togetherWith
-                            (fadeOut(tween(140)) + slideOutVertically(tween(180)) { full -> -full / 20 })
-                    },
-                    label = "dayPanel",
-                ) { date ->
-                    val dayEvents = remember(events, date) { sortDayEvents(events, date) }
-                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        DayHeader(date = date, events = dayEvents)
-                        if (dayEvents.isEmpty()) {
-                            EmptyDayCard(onAdd = { openNew(date) })
-                        } else {
-                            dayEvents.forEach { event ->
-                                EventRow(
-                                    event = event,
-                                    date = date,
-                                    onOpen = { openEdit(event) },
-                                    onToggleDone = { onToggleDone(event.id, date.toString()) },
+                item {
+                    CalendarCard(
+                        events = events,
+                        selectedDate = selectedDate,
+                        month = month,
+                        onSelectDate = { date ->
+                            selectedDate = date
+                            month = YearMonth.from(date)
+                        },
+                        onMonthChange = { month = it },
+                    )
+                }
+
+                // 选中日：整块一起做切换动画，避免列表 item 各自的动画互相打架
+                item {
+                    AnimatedContent(
+                        targetState = selectedDate,
+                        transitionSpec = {
+                            (fadeIn(tween(220)) + slideInVertically(tween(260)) { full -> full / 14 }) togetherWith
+                                (fadeOut(tween(140)) + slideOutVertically(tween(180)) { full -> -full / 20 })
+                        },
+                        label = "dayPanel",
+                    ) { date ->
+                        val dayEvents = remember(events, date) { sortDayEvents(events, date) }
+                        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            DayHeader(date = date, events = dayEvents)
+                            if (dayEvents.isEmpty()) {
+                                EmptyDayCard(onAdd = { openNew(date) })
+                            } else {
+                                dayEvents.forEach { event ->
+                                    EventRow(
+                                        event = event,
+                                        date = date,
+                                        onOpen = { openEdit(event) },
+                                        onToggleDone = { onToggleDone(event.id, date.toString()) },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    UpcomingSection(items = upcoming, onOpen = openEdit)
+                }
+            } else {
+                item {
+                    AnniversarySummary(counters = counters)
+                }
+
+                if (counters.isEmpty()) {
+                    item {
+                        AnniversaryEmptyCard(onAdd = { openNew(today) })
+                    }
+                } else {
+                    // 纪念日一般只有几条，直接放进外层 LazyColumn 的一个 item 里，
+                    // 不嵌套可滚动容器；条目再多也只是一次性组装普通的 Column。
+                    item {
+                        Column(
+                            Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            counters.forEach { counter ->
+                                DayCountCard(
+                                    counter = counter,
+                                    onClick = { openEdit(counter.event) },
                                 )
                             }
                         }
                     }
                 }
-            }
-
-            item {
-                UpcomingSection(items = upcoming, onOpen = openEdit)
             }
 
         }
@@ -207,6 +257,7 @@ fun ScheduleScreen(
         ScheduleEditor(
             event = editingEvent,
             initialDate = selectedDate,
+            initialKind = editorKind,
             onDismiss = {
                 editorVisible = false
                 editingEvent = null
@@ -216,6 +267,226 @@ fun ScheduleScreen(
             onDelete = onDelete,
         )
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 日程 / 纪念日 分段
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 日程页的两个分段；只是同一屏的内容切换，不新增页面与底部入口。 */
+private enum class ScheduleSegment(val label: String) {
+    SCHEDULE("日程"),
+    ANNIVERSARY("纪念日"),
+}
+
+@Composable
+private fun SegmentSwitch(
+    selected: ScheduleSegment,
+    onSelect: (ScheduleSegment) -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(CircleShape)
+            .background(Color(0x12FFFFFF))
+            .border(0.75.dp, Color(0x1FFFFFFF), CircleShape)
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        ScheduleSegment.entries.forEach { item ->
+            val active = item == selected
+            Box(
+                Modifier
+                    .weight(1f)
+                    .clip(CircleShape)
+                    .background(if (active) Color(0x1FFFFFFF) else Color.Transparent)
+                    .clickable { onSelect(item) }
+                    // 竖向 12dp + 文字行高 ≈ 46dp，满足 44dp 的最小点击区。
+                    .padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = item.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (active) RilanColors.Text else RilanColors.TextTertiary,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            }
+        }
+    }
+}
+
+/** 顶部一行统计：「3 个日子 · 最近的还有 12 天」。 */
+@Composable
+private fun AnniversarySummary(counters: List<DayCounter>) {
+    val nearest = counters.firstOrNull { it.direction != Direction.PAST }
+    val nearestText = when {
+        counters.isEmpty() -> "还没有"
+        nearest == null -> "最近的日子都过去了"
+        nearest.days == 0L -> "最近的就是今天"
+        else -> "最近的还有 ${nearest.days} 天"
+    }
+    GlassCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 13.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    text = "纪念日",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = RilanColors.TextTertiary,
+                    letterSpacing = 1.sp,
+                )
+                Text(
+                    text = "${counters.size} 个日子",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = RilanColors.Text,
+                )
+            }
+            Text(
+                text = nearestText,
+                style = MaterialTheme.typography.labelLarge,
+                color = RilanColors.Lilac,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AnniversaryEmptyCard(onAdd: () -> Unit) {
+    GlassCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        contentPadding = PaddingValues(0.dp),
+    ) {
+        Column(
+            Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            EmptyState(
+                title = "还没有纪念日",
+                subtitle = "记下第一个值得数的日子。",
+            )
+            Box(
+                Modifier
+                    .padding(bottom = 20.dp)
+                    .clip(CircleShape)
+                    .background(RilanColors.Lilac.copy(alpha = 0.14f))
+                    .border(1.dp, RilanColors.Lilac.copy(alpha = 0.42f), CircleShape)
+                        .clickable(onClick = onAdd)
+                    .padding(horizontal = 18.dp, vertical = 11.dp),
+            ) {
+                Text(
+                    text = "添加纪念日",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = RilanColors.Lilac,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 一张纪念日卡片：超大天数是主角，标题 / 日期 / 第几个 + 已经多少天退到右侧。
+ * 今天的用月光蓝强调，已经过去的用次要色，其余按类型取色。
+ */
+@Composable
+private fun DayCountCard(counter: DayCounter, onClick: () -> Unit) {
+    val isToday = counter.direction == Direction.TODAY
+    val accent = when {
+        isToday -> RilanColors.Mint
+        counter.direction == Direction.PAST -> RilanColors.TextTertiary
+        else -> kindAccent(counter.event.kind)
+    }
+    GlassCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                if (isToday) {
+                    Text(
+                        text = "今天",
+                        style = MaterialTheme.typography.displayMedium.copy(
+                            fontSize = 27.sp,
+                            lineHeight = 42.sp,
+                        ),
+                        color = accent,
+                        maxLines = 1,
+                    )
+                } else {
+                    // 「已经 / 还有」跟着大数字一起读，避免把「已经 1287 天」看成「还剩」。
+                    Text(
+                        text = counter.primaryLabel,
+                        modifier = Modifier.padding(end = 4.dp, bottom = 11.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = accent.copy(alpha = 0.72f),
+                        maxLines = 1,
+                    )
+                    Text(
+                        text = counter.primaryDays.toString(),
+                        // 天数越长字号越小，5 位数（几十年的纪念日）也不会把右侧文字挤没。
+                        style = MaterialTheme.typography.displayMedium.copy(
+                            fontSize = when {
+                                counter.primaryDays >= 10_000L -> 30.sp
+                                counter.primaryDays >= 1_000L -> 36.sp
+                                else -> 40.sp
+                            },
+                            lineHeight = 42.sp,
+                        ),
+                        color = accent,
+                        maxLines = 1,
+                    )
+                    Text(
+                        text = "天",
+                        modifier = Modifier.padding(start = 3.dp, bottom = 7.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = accent.copy(alpha = 0.72f),
+                    )
+                }
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    text = counter.event.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Medium,
+                    color = RilanColors.Text,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "${counter.event.kind.label} · ${dateWithWeekday(counter.anchor, isToday)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = RilanColors.TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = counter.detail,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isToday) accent.copy(alpha = 0.9f) else RilanColors.TextTertiary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+private fun dateWithWeekday(date: LocalDate, isToday: Boolean): String {
+    val base = "${date.year}年${formatMonthDay(date)} · ${weekdayLabel(date)}"
+    return if (isToday) "$base · 今天" else base
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

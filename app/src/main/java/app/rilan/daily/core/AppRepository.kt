@@ -7,6 +7,7 @@ import app.rilan.daily.data.DeepSeekClient
 import app.rilan.daily.data.Http
 import app.rilan.daily.data.HttpException
 import app.rilan.daily.data.LocationClient
+import app.rilan.daily.data.NetWarmup
 import app.rilan.daily.data.PlaceInfo
 import app.rilan.daily.data.WallpaperClient
 import app.rilan.daily.data.WeatherClient
@@ -25,6 +26,7 @@ import app.rilan.daily.schedule.ScheduleStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
@@ -121,6 +123,8 @@ class AppRepository(context: Context) : McpHost {
     private var activeRefreshes = 0
 
     @Volatile private var weatherJob: Job? = null
+    /** 冷启动「先出温度」的一次性轻量请求；只写内存，绝不落盘。 */
+    @Volatile private var weatherPreviewJob: Job? = null
     /** 轻量实时天气轮询；和全量预报分开，避免互相取消。 */
     @Volatile private var fastWeatherJob: Job? = null
     @Volatile private var lastFastWeatherAt = 0L
@@ -143,6 +147,9 @@ class AppRepository(context: Context) : McpHost {
 
     fun bootstrap() {
         if (!bootstrapped.compareAndSet(false, true)) return
+        // 网络预热必须最先：只解析天气域名，不下载内容、不阻塞调用方、绝不抛异常。
+        // 冷启动第一个天气请求因此不用把 DNS 解析 / 双栈路由探测算进关键路径。
+        NetWarmup.warm()
         NotificationHelper.ensureChannels(appContext)
         ReminderScheduler.ensureDaily(appContext)
         // 每日简报以 AppSettings 为准同步一次闹钟：升级 / 首次启动后设置与已注册闹钟不打架。
@@ -172,15 +179,24 @@ class AppRepository(context: Context) : McpHost {
                     )
                 }
             }
+            // 天气最优先：缓存刚读出来就立刻起跑，不让记录 / 插件 / 信息流排在它前面。
+            // 没有缓存时 refreshWeatherInternal 会额外并行打一发轻量 current，让温度先上屏。
+            if (isWeatherStale()) refreshWeather() else refreshWeatherFast()
+            // 信息流晚 1.2 秒：十几个 RSS 源在弱网下会把几十 KB 的天气 JSON 压在后面。
+            launch {
+                delay(CONTENT_BOOT_DELAY_MS)
+                if (isContentStale()) triggerContentRefresh()
+            }
+            // 壁纸最晚：整张 1080p JPEG 有几百 KB～数 MB，弱网下必须给天气让路。
+            launch {
+                delay(WALLPAPER_BOOT_DELAY_MS)
+                refreshWallpaperIfStale()
+            }
+            // 下面这些只占磁盘 / 本地计算，不抢网络，放在天气起跑之后再读。
             _records.value = runCatching { prefs.loadRecords() }.getOrDefault(emptyList())
             _digests.value = runCatching { prefs.loadDigests() }.getOrDefault(emptyMap())
             pluginStore.warmUp()
             refreshDailyAiForToday()
-            // 壁纸、天气、信息流互不阻塞：壁纸最慢，不能挡在天气前面。
-            launch { refreshWallpaperIfStale() }
-            // 缓存刚读出来，先用一次轻量实时请求把温度拉新；全量预报按 10 分钟周期补。
-            if (isWeatherStale()) refreshWeather() else refreshWeatherFast()
-            if (isContentStale()) triggerContentRefresh()
         }
     }
 
@@ -207,10 +223,17 @@ class AppRepository(context: Context) : McpHost {
     }
 
     fun refreshAll() {
-        refreshWeatherInternal(forceLocate = true)
-        // 手动刷新绕过插件缓存：用户点刷新就是要立刻看到每个源的最新内容。
-        triggerContentRefresh(force = true)
-        refreshWallpaper()
+        // 手动刷新也按「天气先行」：定位改为非强制（坐标还新鲜就直接用），
+        // 不再让 6s 定位 + 2.6s 反查把天气挡在后面；「重新定位」仍由 locateNow() 负责。
+        val weather = refreshWeatherInternal(forceLocate = false)
+        // 信息流与壁纸等天气出结果后再起跑（最多等 6 秒）：弱网下十几个 RSS 源 +
+        // 整张壁纸会立刻把天气挤进带宽队列，这正是「点刷新后很久才出天气」的根因之一。
+        scope.launch {
+            withTimeoutOrNull(REFRESH_WEATHER_LEAD_MS) { weather?.join() }
+            // 手动刷新绕过插件缓存：用户点刷新就是要立刻看到每个源的最新内容。
+            triggerContentRefresh(force = true)
+            refreshWallpaper()
+        }
     }
 
     /** 跨过零点后，昨天的总览不能继续冒充今天。 */
@@ -286,13 +309,25 @@ class AppRepository(context: Context) : McpHost {
         return last <= 0L || System.currentTimeMillis() - last > LOCATION_TTL_MS
     }
 
-    private fun refreshWeatherInternal(forceLocate: Boolean) {
-        if (weatherJob?.isActive == true) return
-        weatherJob = scope.launch {
+    /**
+     * 全量天气刷新。启动 / 手动刷新都从这里进来。
+     *
+     * 时序设计：天气请求先用「现有坐标」立刻起跑，定位只作为并行任务，
+     * 天气结果一到就先上屏——定位慢（LocationClient 自己可能要 6s 定位 + 2.6s 反查）
+     * 不再把已经到手的数据压在内存里等。定位回来后如果坐标变了，再按新坐标重拉一次。
+     */
+    private fun refreshWeatherInternal(forceLocate: Boolean): Job? {
+        if (weatherJob?.isActive == true) return weatherJob
+        // LAZY + 先登记再 start：避免并发调用在 weatherJob 赋值前重复起一份请求。
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             // 全量刷新会整体替换天气对象，先停掉可能回来的轻量轮询，避免旧值覆盖新值。
             fastWeatherJob?.cancel()
             beginRefresh()
+            // 只标天气自己的刷新，天气卡据此显示「更新中」，不至于被信息流刷新带偏。
+            _home.update { it.copy(weatherRefreshing = true) }
             var early: Deferred<Result<WeatherData>>? = null
+            // 定位也做成并行任务，不再在天气链路上原地等待。
+            var locationJob: Deferred<PlaceInfo?>? = null
             try {
                 val settings = _settings.value
                 val auto = settings.autoLocation
@@ -313,18 +348,54 @@ class AppRepository(context: Context) : McpHost {
                 // 先用上次坐标（或手动城市）立刻拉天气；定位与区县反查在下面并行补，
                 // 位置服务慢时不再把天气卡在 loading 里十几秒。
                 if (!auto || settings.lastLocationAt > 0L) {
-                    // 把结果包成 Result：即使定位分支最终不 await，这个 async 也永远
+                    // 把结果包成 Result：即使定位分支最终不消费，这个 async 也永远
                     // 不会以异常结束，也就不会把失败冒泡到 scope 当成未捕获异常。
                     // 用户报过的 connection closed 闪退就是这条路径。
                     early = async { runCatching { weatherClient.fetch(settings) } }
+                    // 冷启动没有缓存时，额外并行打一发轻量 current（几百字节），
+                    // 让卡片先显示当前温度；全量预报回来会整体覆盖。占位数据只进内存。
+                    if (_home.value.weather == null) previewWeatherCurrent(settings)
                 }
 
-                var place: PlaceInfo? = null
+                // 定位改成并行任务：不再让天气等定位。
                 if (auto && permitted && (forceLocate || isLocationStale())) {
                     _home.update { it.copy(locating = true, locationError = null) }
-                    place = withTimeoutOrNull(8_000L) {
-                        runCatching { locationClient.currentPlace() }.getOrNull()
+                    locationJob = async {
+                        withTimeoutOrNull(8_000L) {
+                            runCatching { locationClient.currentPlace() }.getOrNull()
+                        }
                     }
+                } else if (auto && !permitted) {
+                    _home.update { it.copy(locating = false, locationError = "未开启定位权限") }
+                    // 从未定位成功过时，不用「北京」这种默认坐标冒充当前位置
+                    if (settings.lastLocationAt <= 0L) {
+                        early?.cancel()
+                        _home.update {
+                            it.copy(
+                                weatherError = "开启定位，或到设置里手动选择城市",
+                                loading = false,
+                            )
+                        }
+                        return@launch
+                    }
+                }
+
+                // 天气先到就先上屏：这一步不再等定位结果。
+                var applied = false
+                val pending = early
+                if (pending != null) {
+                    val fetched = pending.await().getOrNull()
+                    if (fetched != null) {
+                        applyWeather(fetched)
+                        applied = true
+                    }
+                }
+
+                // 再收定位结果；位置文案后到再更新即可。
+                var place: PlaceInfo? = null
+                val locating = locationJob
+                if (locating != null) {
+                    place = locating.await()
                     if (place != null) {
                         applyPlace(place)
                         _home.update { it.copy(locating = false, locationError = null) }
@@ -344,19 +415,6 @@ class AppRepository(context: Context) : McpHost {
                             return@launch
                         }
                     }
-                } else if (auto && !permitted) {
-                    _home.update { it.copy(locating = false, locationError = "未开启定位权限") }
-                    // 从未定位成功过时，不用「北京」这种默认坐标冒充当前位置
-                    if (settings.lastLocationAt <= 0L) {
-                        early?.cancel()
-                        _home.update {
-                            it.copy(
-                                weatherError = "开启定位，或到设置里手动选择城市",
-                                loading = false,
-                            )
-                        }
-                        return@launch
-                    }
                 }
 
                 val located = place
@@ -364,39 +422,21 @@ class AppRepository(context: Context) : McpHost {
                     abs(located.latitude - settings.latitude) > 1e-4 ||
                         abs(located.longitude - settings.longitude) > 1e-4
                     )
-                var data: WeatherData? = null
-                val pending = early
-                if (pending != null) {
-                    if (moved) {
-                        // 位置变了，旧坐标的天气作废，换新坐标再拉一次
-                        pending.cancel()
-                    } else {
-                        // 用 runCatching 解包：deferred 若已被取消不应把 CancellationException
-                        // 一路抛到 scope（那会被当未捕获异常），当成「没有预取到」走下面的重拉即可。
-                        data = pending.await().getOrNull()
-                    }
+                // 位置变了，旧坐标的天气作废；预取失败（Result 里是 error）也在这里同步重拉，
+                // 让错误落到下面的 catch(Throwable) 转成界面错误态；绝不让异常沉到协程顶层。
+                if (moved || !applied) {
+                    applyWeather(weatherClient.fetch(_settings.value))
                 }
-                // 预取失败（Result 里是 error）时再同步拉一次，让错误落到下面的 catch(Throwable)
-                // 转成界面错误态；这里绝不让异常沉到协程顶层变成闪退。
-                val fresh = data ?: weatherClient.fetch(_settings.value)
-                prefs.saveWeatherCache(fresh)
-                _home.update {
-                    it.copy(
-                        weather = fresh,
-                        weatherError = null,
-                        loading = false,
-                        lastUpdated = maxOf(it.lastUpdated, System.currentTimeMillis()),
-                    )
-                }
-                mutateSettings { it.copy(lastWeatherAt = System.currentTimeMillis()) }
             } catch (cancel: CancellationException) {
                 early?.cancel()
+                locationJob?.cancel()
                 // 整个仓库在关闭时才上抛；子任务被主动取消（重新定位 / 切自动定位）
                 // 属正常路径，静默结束即可——旧版在这里写错误文本会和紧接着的新请求竞态，
                 // 留下「天气更新已取消」的假错误。
                 if (!scope.isActive) throw cancel
             } catch (t: Throwable) {
                 early?.cancel()
+                locationJob?.cancel()
                 _home.update {
                     it.copy(
                         weatherError = friendlyError(t),
@@ -405,7 +445,73 @@ class AppRepository(context: Context) : McpHost {
                     )
                 }
             } finally {
+                _home.update { it.copy(weatherRefreshing = false) }
                 endRefresh()
+            }
+        }
+        weatherJob = job
+        job.start()
+        return job
+    }
+
+    /** 全量天气落地：写缓存、推 UI、记刷新时间；同时停掉「先出温度」的占位请求。 */
+    private fun applyWeather(data: WeatherData) {
+        weatherPreviewJob?.cancel()
+        weatherPreviewJob = null
+        prefs.saveWeatherCache(data)
+        _home.update {
+            it.copy(
+                weather = data,
+                weatherError = null,
+                loading = false,
+                lastUpdated = maxOf(it.lastUpdated, System.currentTimeMillis()),
+            )
+        }
+        mutateSettings { it.copy(lastWeatherAt = System.currentTimeMillis()) }
+    }
+
+    /**
+     * 冷启动「先出温度」：没有缓存天气时，和全量预报并行打一发轻量 current，
+     * 拿到就先组一个只有实时温度的占位 WeatherData 推给 UI，卡片不再一直转骨架屏。
+     *
+     * 占位数据只写内存、不落盘：它没有逐小时 / 7 天预报，写进缓存会让下次冷启动
+     * 读到残缺天气。全量数据返回后由 [applyWeather] 整体覆盖（WeatherCard 依据
+     * 「hourly / daily 都为空」识别这是占位数据，不画预报区块、不伪造高低温）。
+     */
+    private fun previewWeatherCurrent(settings: AppSettings) {
+        if (weatherPreviewJob?.isActive == true) return
+        val city = settings.city
+        val place = settings.place
+        weatherPreviewJob = scope.launch {
+            val preview = runCatching { weatherClient.fetchCurrent(settings) }.getOrNull()
+                ?: return@launch
+            _home.update { h ->
+                // 全量天气已经先到了 / 用户已经换了城市：这份占位数据作废。
+                if (h.weather != null || _settings.value.city != city) {
+                    h
+                } else {
+                    h.copy(
+                        weather = WeatherData(
+                            city = city,
+                            place = place,
+                            updatedAt = preview.fetchedAt,
+                            currentTemp = preview.temp,
+                            feelsLike = preview.feelsLike,
+                            humidity = preview.humidity,
+                            windSpeed = preview.windSpeed,
+                            windDirection = preview.windDirection,
+                            weatherCode = preview.weatherCode,
+                            isDay = preview.isDay,
+                            // 没有预报就不伪造高低温，只把当前温度放进去；
+                            // 天气卡按「只有实时温度」的形态渲染。
+                            high = preview.temp,
+                            low = preview.temp,
+                            hourly = emptyList(),
+                            daily = emptyList(),
+                        ),
+                        loading = false,
+                    )
+                }
             }
         }
     }
@@ -440,7 +546,11 @@ class AppRepository(context: Context) : McpHost {
                     isDay = fresh.isDay,
                     updatedAt = fresh.fetchedAt,
                 )
-                prefs.saveWeatherCache(merged)
+                // 占位数据（只有实时温度、没有逐小时/一周预报）不落盘：
+                // 否则下次冷启动会读到残缺缓存，卡片会误以为拿到了完整预报。
+                if (merged.daily.isNotEmpty() || merged.hourly.isNotEmpty()) {
+                    prefs.saveWeatherCache(merged)
+                }
                 _home.update {
                     it.copy(
                         weather = merged,
@@ -838,6 +948,15 @@ class AppRepository(context: Context) : McpHost {
          * 10 分钟缓存兜住，所以这里可以把心跳调快而不产生大量重复下载。
          */
         const val CONTENT_TTL_MS = 3 * 60_000L
+
+        /** 启动时信息流让路给天气：十几个 RSS 源晚 1.2 秒再起跑。 */
+        const val CONTENT_BOOT_DELAY_MS = 1_200L
+
+        /** 启动时壁纸最后起跑：整张 JPEG 几百 KB～数 MB，弱网下必须给天气让路。 */
+        const val WALLPAPER_BOOT_DELAY_MS = 3_000L
+
+        /** 手动刷新时信息流/壁纸最多等天气这么久，避免天气异常时刷新按钮像没反应。 */
+        const val REFRESH_WEATHER_LEAD_MS = 6_000L
 
         /** 自动定位周期；10 分钟以内移动不会频繁唤醒 GPS。 */
         const val LOCATION_TTL_MS = 10 * 60_000L

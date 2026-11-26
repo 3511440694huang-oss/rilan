@@ -420,6 +420,7 @@ internal fun kindAccent(kind: EventKind): Color = when (kind) {
     EventKind.TASK -> RilanColors.Mint
     EventKind.BIRTHDAY -> RilanColors.Lavender
     EventKind.ANNIVERSARY -> RilanColors.Gold
+    EventKind.COUNTDOWN -> RilanColors.Sky
     EventKind.MEMO -> RilanColors.Blue
 }
 

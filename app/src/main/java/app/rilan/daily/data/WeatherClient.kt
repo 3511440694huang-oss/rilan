@@ -1,5 +1,7 @@
 package app.rilan.daily.data
 
+import android.util.Log
+import app.rilan.daily.BuildConfig
 import app.rilan.daily.core.AirQuality
 import app.rilan.daily.core.AppSettings
 import app.rilan.daily.core.CityResult
@@ -7,11 +9,15 @@ import app.rilan.daily.core.DailyWeather
 import app.rilan.daily.core.HourlyWeather
 import app.rilan.daily.core.WeatherData
 import app.rilan.daily.core.WeatherNow
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -65,47 +71,103 @@ class WeatherClient {
         val currentUrl: (AppSettings) -> String? = { null },
         val normalize: (JSONObject) -> JSONObject = { it },
         val timeout: Timeout = Timeout.NORMAL,
+        /** 需要单独覆盖请求头的源（例如 met.no 的 ToS 要求真实 UA）。 */
+        val headers: Map<String, String> = emptyMap(),
     )
 
     private enum class Timeout { NORMAL, FAST }
 
-    /** 源顺序：主源 Open-Meteo → wttr.in → MET Norway，任一失败自动尝试下一个。 */
+    private val raceErrors = CoroutineExceptionHandler { _, t ->
+        // 兜底：正常路径下所有异常都已在本任务内部消化；真走到这里只可能是极端边界，
+        // 记一条日志即可，绝不能冒到默认 uncaught handler 触发闪退。
+        runCatching { Log.w("WeatherRace", "hedged request failed", t) }
+    }
+
+    /** 对冲起跑时间：主源 0ms、第二源 800ms、第三源 1800ms（绝对值）。 */
+    private val hedgeStartMs = longArrayOf(0L, 800L, 1_800L)
+
+    /** 源顺序：主源 Open-Meteo → wttr.in → MET Norway，按 [hedgeStartMs] 阶梯对冲起跑。 */
     private val sources = listOf(
         Source("open-meteo", ::forecastUrl, ::currentUrl),
         Source("wttr.in", ::wttrUrl, ::wttrCurrentUrl, ::normalizeWttr, Timeout.FAST),
-        Source("met.no", ::metUrl, ::metCurrentUrl, ::normalizeMet, Timeout.FAST),
+        // met.no 的 ToS 明确要求 UA 带 App 名 + 联系方式，并点名「冒充浏览器 UA 会被封」；
+        // Http 的 headers 在默认 UA 之后写入，所以这里能覆盖掉全局的浏览器 UA。
+        Source(
+            "met.no", ::metUrl, ::metCurrentUrl, ::normalizeMet, Timeout.FAST,
+            headers = mapOf("User-Agent" to MET_UA),
+        ),
     )
 
     /**
-     * 依次尝试各数据源：当前源抛异常（网络 / HTTP / 解析）就换下一个；
-     * 取消（CancellationException）必须立刻向上抛，不能吞掉继续打下一个源。
-     * 全部失败时把最后一个异常交给仓库展示中文原因。
+     * 对冲竞速（hedged requests）：主源立刻起跑，备源在 800ms / 1800ms 跟进，
+     * 第一个成功（含「缺字段」这类软失败校验通过）的结果立即返回，其余请求全部取消。
+     *
+     * 为什么不再串行兜底：弱网下主源要卡满 connect 才算失败，用户先白等一整轮；
+     * 对冲让慢主源与备用源在时间上重叠，首字节时间从「最慢那个」变成「最快的那个」，
+     * 而网络正常时备用源还在 delay 里就被取消，不会多打一次请求。
+     *
+     * 取消 / 异常语义：
+     * - 调用方被取消时，[Channel.receive] 原样抛出 CancellationException，不会转成 IOException；
+     * - 竞速任务只吞自己的异常（含「竞速已结束、channel 已关闭」的结果竞态），
+     *   绝不冒到 scope 顶层；
+     * - 胜出（或全部失败）后 finally 立刻取消其余请求，避免继续白耗流量。
      */
     private suspend fun <T> trySources(block: suspend (Source) -> T): T {
-        var last: Throwable? = null
-        for (source in sources) {
-            try {
-                return block(source)
-            } catch (c: CancellationException) {
-                throw c
-            } catch (t: Throwable) {
-                last = t
+        val results = Channel<Result<T>>(Channel.UNLIMITED)
+        // 竞速专用独立作用域：不能挂在调用方 Job 下。HttpURLConnection 是阻塞 IO，
+        // job.cancel() 不会中断已经卡在 socket connect/read 上的线程；输家若是结构化
+        // 子任务，赢家到手后外层还要陪它等完超时，竞速收益就白费了。胜出后 cancel
+        // 整个 scope（外层立即返回）。每个 attempt 内部全包 try/catch，再加
+        // [raceErrors] 兜底，绝不会有异常冒到默认 uncaught handler —— 历史上的
+        // connection closed 闪退就是这类漏网异常造成的。
+        val raceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + raceErrors)
+        sources.forEachIndexed { index, source ->
+            raceScope.launch {
+                try {
+                    val startAt = hedgeStartMs[index.coerceAtMost(hedgeStartMs.lastIndex)]
+                    if (startAt > 0L) delay(startAt)
+                    val outcome: Result<T>? = try {
+                        Result.success(block(source))
+                    } catch (c: CancellationException) {
+                        // 输给更快的源 / 整段刷新被取消：正常收尾，不算失败事件。
+                        null
+                    } catch (t: Throwable) {
+                        Result.failure(t)
+                    }
+                    if (outcome != null) results.trySend(outcome)
+                } catch (ignored: Throwable) {
+                    // 延迟阶段被取消等边界：静默收尾，绝不能落到 raceScope 顶层。
+                }
             }
         }
-        throw last ?: IOException("天气源全部失败")
+        try {
+            var last: Throwable? = null
+            var failed = 0
+            while (failed < sources.size) {
+                val outcome = results.receive()
+                if (outcome.isSuccess) return outcome.getOrThrow()
+                failed++
+                last = outcome.exceptionOrNull()
+            }
+            throw last ?: IOException("天气源全部失败")
+        } finally {
+            // 胜出后必须停掉其余请求：既省流量，也避免备用源的回包继续占用弱网带宽。
+            raceScope.cancel()
+            results.close()
+        }
     }
 
     private suspend fun sourceJson(source: Source, settings: AppSettings, action: String): JSONObject {
+        // 主源 2.5s/6s、备用源 2s/4s；不再叠加「失败重试一次」——第二次机会由对冲的
+        // 备用源提供，否则「重试 × 多源」会把最坏等待叠成几十秒。
         val fast = source.timeout == Timeout.FAST
-        // 备用源用短超时且跳过 text() 的二次重试：避免 3 源 × 2 次 × 9s 的最坏 54s 等待。
-        val body = if (fast) {
-            requestTextOnce(
-                source.url(settings), action,
-                FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS,
-            )
-        } else {
-            text(source.url(settings), action, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
-        }
+        val body = text(
+            source.url(settings),
+            action,
+            if (fast) FAST_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS,
+            if (fast) FAST_READ_TIMEOUT_MS else READ_TIMEOUT_MS,
+            headers = source.headers,
+        )
         val root = try {
             JSONObject(body)
         } catch (e: Exception) {
@@ -127,7 +189,10 @@ class WeatherClient {
             null
         }
         try {
-            val data = fetchForecast(settings)
+            // 总预算兜底：哪怕源全都在慢慢吞吞，也不能让卡片无限转圈。
+            // 超时转成中文 IOException，交给仓库走既有的错误态文案。
+            val data = withTimeoutOrNull(TOTAL_BUDGET_MS) { fetchForecast(settings) }
+                ?: throw IOException("获取天气失败：天气服务响应超时")
             val air = reusableAir ?: withTimeoutOrNull(AIR_WAIT_MS) { airJob?.await() }
             if (airJob != null) {
                 if (air == null) {
@@ -153,37 +218,42 @@ class WeatherClient {
      * 这个接口只负责让卡片上的温度、体感、风、天气现象尽快跟上最新值。
      */
     suspend fun fetchCurrent(settings: AppSettings): WeatherNow? = withContext(Dispatchers.IO) {
-        // 把「缺字段 / 温度非法」这类软失败也当作该源不可用，继续尝试下一个源。
-        val now = trySources { source ->
-            val url = source.currentUrl(settings)
-                ?: throw IOException("${source.name} 不支持实时轮询")
-            val fast = source.timeout == Timeout.FAST
-            val body = if (fast) {
-                requestTextOnce(url, "获取实时天气失败", FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS)
-            } else {
-                text(url, "获取实时天气失败", FAST_CONNECT_TIMEOUT_MS, FAST_READ_TIMEOUT_MS)
+        // 轻量轮询同样走对冲竞速，并加总预算兜底：一次轮询失败不能拖住下个心跳。
+        val now = withTimeoutOrNull(CURRENT_BUDGET_MS) {
+            // 把「缺字段 / 温度非法」这类软失败也当作该源不可用，继续竞速。
+            trySources { source ->
+                val url = source.currentUrl(settings)
+                    ?: throw IOException("${source.name} 不支持实时轮询")
+                // 主源实时接口也用正常超时（2.5s/6s 兜住冷连接与 TLS），备用源 2s/4s。
+                val fast = source.timeout == Timeout.FAST
+                val body = text(
+                    url, "获取实时天气失败",
+                    if (fast) FAST_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS,
+                    if (fast) FAST_READ_TIMEOUT_MS else READ_TIMEOUT_MS,
+                    headers = source.headers,
+                )
+                val parsed = try {
+                    JSONObject(body)
+                } catch (e: Exception) {
+                    throw IOException("获取实时天气失败：返回内容无法解析", e)
+                }
+                val root = source.normalize(parsed)
+                val current = root.optJSONObject("current")
+                    ?: throw IOException("${source.name} 实时数据不完整")
+                val temp = current.optDouble("temperature_2m", Double.NaN)
+                if (temp.isNaN()) throw IOException("${source.name} 实时温度缺失")
+                WeatherNow(
+                    temp = temp,
+                    feelsLike = current.optDouble("apparent_temperature", temp),
+                    humidity = current.optInt("relative_humidity_2m", 0),
+                    windSpeed = current.optDouble("wind_speed_10m", 0.0),
+                    windDirection = current.optInt("wind_direction_10m", 0),
+                    weatherCode = current.optInt("weather_code", UNKNOWN_CODE),
+                    isDay = current.optInt("is_day", 1) != 0,
+                    fetchedAt = System.currentTimeMillis(),
+                )
             }
-            val parsed = try {
-                JSONObject(body)
-            } catch (e: Exception) {
-                throw IOException("获取实时天气失败：返回内容无法解析", e)
-            }
-            val root = source.normalize(parsed)
-            val current = root.optJSONObject("current")
-                ?: throw IOException("${source.name} 实时数据不完整")
-            val temp = current.optDouble("temperature_2m", Double.NaN)
-            if (temp.isNaN()) throw IOException("${source.name} 实时温度缺失")
-            WeatherNow(
-                temp = temp,
-                feelsLike = current.optDouble("apparent_temperature", temp),
-                humidity = current.optInt("relative_humidity_2m", 0),
-                windSpeed = current.optDouble("wind_speed_10m", 0.0),
-                windDirection = current.optInt("wind_direction_10m", 0),
-                weatherCode = current.optInt("weather_code", UNKNOWN_CODE),
-                isDay = current.optInt("is_day", 1) != 0,
-                fetchedAt = System.currentTimeMillis(),
-            )
-        }
+        } ?: throw IOException("获取实时天气失败：天气服务响应超时")
         // 所有源都成功返回但无有效数据时，维持原有「静默返回 null」语义（仓库侧不弹错）。
         now
     }
@@ -300,7 +370,8 @@ class WeatherClient {
     }
 
     /**
-     * 网络请求：连接 / 读超时都收紧到移动端可接受的范围，失败自动重试一次；
+     * 网络请求：单次尝试，不做「失败重试一次」。
+     * 对冲竞速里的备用源就是第二次机会，再叠加重试只会让弱网下的最坏等待翻倍。
      * HTTP 状态码错误（401 / 429 / 5xx 等）不重试，直接把中文原因交给仓库。
      */
     private suspend fun text(
@@ -308,33 +379,20 @@ class WeatherClient {
         action: String,
         connectTimeoutMs: Int = CONNECT_TIMEOUT_MS,
         readTimeoutMs: Int = READ_TIMEOUT_MS,
-    ): String {
-        var lastError: IOException? = null
-        for (attempt in 0..REQUEST_RETRIES) {
-            try {
-                return requestTextOnce(url, action, connectTimeoutMs, readTimeoutMs)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: HttpException) {
-                throw e
-            } catch (e: IOException) {
-                lastError = e
-                if (attempt < REQUEST_RETRIES) delay(RETRY_DELAY_MS)
-            }
-        }
-        throw lastError ?: IOException("$action：网络连接异常")
-    }
+        headers: Map<String, String> = emptyMap(),
+    ): String = requestTextOnce(url, action, connectTimeoutMs, readTimeoutMs, headers)
 
     private suspend fun requestTextOnce(
         url: String,
         action: String,
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
+        headers: Map<String, String> = emptyMap(),
     ): String {
         val body = try {
             Http.getText(
                 url,
-                headers = mapOf("Accept" to "application/json"),
+                headers = mapOf("Accept" to "application/json") + headers,
                 connectTimeoutMs = connectTimeoutMs,
                 readTimeoutMs = readTimeoutMs,
             )
@@ -351,7 +409,7 @@ class WeatherClient {
     }
 
     private fun networkReason(e: Exception): String = when (e) {
-        is SocketTimeoutException -> "天气服务响应慢，已自动重试，请稍后再试"
+        is SocketTimeoutException -> "天气服务响应慢，请稍后再试"
         is UnknownHostException -> "网络不可用，请检查连接"
         else -> e.message?.takeIf { it.isNotBlank() } ?: "网络连接异常"
     }
@@ -698,15 +756,30 @@ class WeatherClient {
         const val MISSING_INT = Int.MIN_VALUE
         const val DEFAULT_TIMEZONE = "Asia/Shanghai"
 
-        /** 移动网络下 4.5 秒连不上基本可以判定为弱网，不再死等；失败重试一次。 */
-        const val CONNECT_TIMEOUT_MS = 4_500
-        const val READ_TIMEOUT_MS = 9_000
+        /**
+         * 主源 2.5 秒连不上就交给对冲的备用源（connectTimeout 对每个 IP 各计一次，
+         * 双栈机型上要 ×2，不能再按 4.5 秒放大）；读 6 秒兜住 TLS 握手 + 弱网传输。
+         */
+        const val CONNECT_TIMEOUT_MS = 2_500
+        const val READ_TIMEOUT_MS = 6_000
 
-        /** 轻量实时轮询：弱网也别拖住下一次，超时更短、不阻塞。 */
-        const val FAST_CONNECT_TIMEOUT_MS = 3_000
-        const val FAST_READ_TIMEOUT_MS = 5_000
-        const val REQUEST_RETRIES = 1
-        const val RETRY_DELAY_MS = 350L
+        /** 备用源快试快换：2s/4s，失败由竞速里更快的赢家覆盖。 */
+        const val FAST_CONNECT_TIMEOUT_MS = 2_000
+        const val FAST_READ_TIMEOUT_MS = 4_000
+
+        /** 单次全量天气总预算：到点必须给 UI 一个中文错误，不能无限转圈。 */
+        const val TOTAL_BUDGET_MS = 9_000L
+
+        /** 轻量实时轮询的总预算：一次失败不能拖住下个心跳，也服务冷启动「先出温度」。 */
+        const val CURRENT_BUDGET_MS = 9_000L
+
+        /**
+         * met.no ToS 要求的 UA：App 名 / 版本 + 可提 issue 的仓库。
+         * 不能用浏览器 UA，也不能用 Dalvik 之类的泛化 UA（官方明确会 403 / 封禁）。
+         */
+        val MET_UA: String =
+            "RilanDaily/${BuildConfig.VERSION_NAME} (app.rilan.daily; " +
+                "+https://github.com/3511440694huang-oss/rilan)"
 
         /** 主天气到手后，最多再等空气质量这么久，等不到就放弃这块可选数据。 */
         const val AIR_WAIT_MS = 2_200L

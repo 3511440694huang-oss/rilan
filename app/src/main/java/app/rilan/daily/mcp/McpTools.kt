@@ -21,7 +21,7 @@ private const val EMPTY_WEATHER_JSON = "{\"message\":\"暂无天气数据\"}"
 private val NEWS_CATEGORIES = listOf("GENERAL", "AI", "WEIBO", "BILIBILI", "DOUYIN", "SECURITY", "WORLD")
 private val SUMMARY_PERIODS = listOf("DAY", "WEEK", "MONTH", "QUARTER", "HALF_YEAR", "YEAR")
 private val PRIORITIES = listOf("LOW", "MEDIUM", "HIGH")
-private val EVENT_KINDS = listOf("TASK", "BIRTHDAY", "ANNIVERSARY", "MEMO")
+private val EVENT_KINDS = listOf("TASK", "BIRTHDAY", "ANNIVERSARY", "COUNTDOWN", "MEMO")
 private val REPEAT_RULES = listOf("NONE", "DAILY", "WEEKLY", "MONTHLY", "YEARLY")
 private val DATE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
 
